@@ -1,0 +1,37 @@
+{
+  "permissionMode": "default",
+  "permissionRules": [
+    {
+      "source": "project",
+      "ruleBehavior": "allow",
+      "ruleValue": {
+        "toolName": "Read",
+        "ruleContent": "*"
+      }
+    },
+    {
+      "source": "project",
+      "ruleBehavior": "allow",
+      "ruleValue": {
+        "toolName": "Bash",
+        "ruleContent": "ls *"
+      }
+    },
+    {
+      "source": "project",
+      "ruleBehavior": "ask",
+      "ruleValue": {
+        "toolName": "Bash",
+        "ruleContent": "*"
+      }
+    },
+    {
+      "source": "project",
+      "ruleBehavior": "deny",
+      "ruleValue": {
+        "toolName": "Bash",
+        "ruleContent": "rm -rf *"
+      }
+    }
+  ]
+}
