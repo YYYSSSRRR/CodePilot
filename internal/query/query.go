@@ -72,40 +72,50 @@ type accBlock struct {
 }
 
 // ---------------------------------------------------------------------------
-// Run — ReAct loop
+// Runner — ReAct loop
 // ---------------------------------------------------------------------------
 
-func Run(ctx context.Context, p Params, events chan<- Event) {
+// Runner drives the ReAct loop. Create via NewRunner.
+type Runner struct {
+	params Params
+	client *apiclient.Client
+}
+
+func NewRunner(params Params) *Runner {
+	return &Runner{
+		params: params,
+		client: apiclient.NewClient(params.APIKey, params.BaseURL),
+	}
+}
+
+// Run starts the ReAct loop. It blocks until the conversation turn is done.
+func (r *Runner) Run(ctx context.Context, events chan<- Event) {
 	defer close(events)
 
 	for turn := 0; ; turn++ {
-		// 1. Check interrupt before starting a new turn
 		if err := ctx.Err(); err != nil {
 			events <- Event{Type: EventTurnComplete, StopReason: "user_interrupt"}
 			events <- Event{Type: EventQueryDone}
 			return
 		}
 
-		// 2. Build API request
-		apiMessages := extractMessages(p.Messages)
+		apiMessages := extractMessages(r.params.Messages)
 		apiReq := types.APIRequest{
-			Model:     p.Model,
+			Model:     r.params.Model,
 			MaxTokens: 8192,
-			System:    p.SystemPrompt,
-			Messages:  types.MessagesToAPI(apiMessages),
-			Tools:     p.Tools.Definitions(),
+			System:    r.params.SystemPrompt,
+			Messages:  types.Messages(apiMessages).ToAPI(),
+			Tools:     r.params.Tools.Definitions(),
 		}
 
-		// 3. Call API streaming
-		stream, err := apiclient.StreamMessages(ctx, p.APIKey, p.BaseURL, apiReq)
+		stream, err := r.client.StreamMessages(ctx, apiReq)
 		if err != nil {
 			events <- Event{Type: EventError, Err: fmt.Errorf("API call: %w", err)}
 			events <- Event{Type: EventQueryDone}
 			return
 		}
 
-		// 4. Process stream — tool_use blocks execute tools immediately in goroutines
-		turnResult := processStream(ctx, stream, p, events)
+		turnResult := r.processStream(ctx, stream, events)
 		stream.Close()
 
 		if turnResult.Err != nil {
@@ -114,9 +124,8 @@ func Run(ctx context.Context, p Params, events chan<- Event) {
 			return
 		}
 
-		// 5. Check interrupt — generate synthetic results for incomplete tools
 		if err := ctx.Err(); err != nil {
-			turnResult = handleInterrupt(turnResult, events)
+			turnResult = r.handleInterrupt(turnResult, events)
 			if turnResult == nil {
 				events <- Event{Type: EventTurnComplete, StopReason: "user_interrupt"}
 				events <- Event{Type: EventQueryDone}
@@ -124,41 +133,52 @@ func Run(ctx context.Context, p Params, events chan<- Event) {
 			}
 		}
 
-		// 6. Emit TurnComplete
 		events <- Event{Type: EventTurnComplete, StopReason: turnResult.StopReason}
 
-		// 7. No tool uses → conversation turn done
 		if len(turnResult.ToolUses) == 0 {
 			events <- Event{Type: EventQueryDone}
 			return
 		}
 
-		// 8. Store messages for next turn
 		if turnResult.AssistantMsg.Role != "" {
-			p.Messages = append(p.Messages, MessageState{
+			r.params.Messages = append(r.params.Messages, MessageState{
 				Message:       turnResult.AssistantMsg,
 				TurnCompleted: true,
 			})
 		}
-		p.Messages = appendToolResults(p.Messages, turnResult.ToolResults)
+		r.params.Messages = appendToolResults(r.params.Messages, turnResult.ToolResults)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// processStream
+// Turn — per-stream state
 // ---------------------------------------------------------------------------
 
-func processStream(ctx context.Context, stream *apiclient.Stream, p Params, events chan<- Event) *TurnResultExt {
-	res := &TurnResultExt{}
-	res.ToolResults = make([]types.ContentBlock, 0)
+type turn struct {
+	ctx       context.Context
+	runner    *Runner
+	events    chan<- Event
+	res       *TurnResultExt
+	accBlocks []accBlock
+	toolMu    sync.Mutex
+	toolWG    sync.WaitGroup
+	results   []toolResultItem
+	toolUses  []ToolUseInfo
+}
 
-	var accBlocks []accBlock
-	var (
-		toolMu      sync.Mutex
-		toolWG      sync.WaitGroup
-		results     []toolResultItem
-		toolUses    []ToolUseInfo
-	)
+func newTurn(ctx context.Context, r *Runner, events chan<- Event) *turn {
+	return &turn{
+		ctx:    ctx,
+		runner: r,
+		events: events,
+		res: &TurnResultExt{
+			ToolResults: make([]types.ContentBlock, 0),
+		},
+	}
+}
+
+func (r *Runner) processStream(ctx context.Context, stream *apiclient.Stream, events chan<- Event) *TurnResultExt {
+	t := newTurn(ctx, r, events)
 
 	for {
 		sseEvent, err := stream.Recv()
@@ -167,63 +187,55 @@ func processStream(ctx context.Context, stream *apiclient.Stream, p Params, even
 		}
 		if err != nil {
 			if ctx.Err() != nil {
-				res.Err = ctx.Err()
-				return res
+				t.res.Err = ctx.Err()
+				return t.res
 			}
-			res.Err = fmt.Errorf("stream recv: %w", err)
-			return res
+			t.res.Err = fmt.Errorf("stream recv: %w", err)
+			return t.res
 		}
 		if err := ctx.Err(); err != nil {
-			res.Err = err
-			return res
+			t.res.Err = err
+			return t.res
 		}
 
 		switch sseEvent.Type {
 		case "message_start":
-			handleMessageStart(sseEvent.Data, res)
-			if res.Err != nil {
-				return res
+			t.handleMessageStart(sseEvent.Data)
+			if t.res.Err != nil {
+				return t.res
 			}
 
 		case "content_block_start":
-			handleBlockStart(sseEvent.Data, &accBlocks, events, res)
-			if res.Err != nil {
-				return res
+			t.handleBlockStart(sseEvent.Data)
+			if t.res.Err != nil {
+				return t.res
 			}
 
 		case "content_block_delta":
-			handleBlockDelta(sseEvent.Data, &accBlocks, events, res)
-			if res.Err != nil {
-				return res
+			t.handleBlockDelta(sseEvent.Data)
+			if t.res.Err != nil {
+				return t.res
 			}
 
 		case "content_block_stop":
-			tu := handleBlockStop(sseEvent.Data, &accBlocks, events, res)
-			if res.Err != nil {
-				return res
-			}
-			if tu != nil {
-				toolUses = append(toolUses, *tu)
-				toolWG.Add(1)
-				go func(t ToolUseInfo) {
-					defer toolWG.Done()
-					executeAndCollect(ctx, p, t, events, &toolMu, &results)
-				}(*tu)
+			t.handleBlockStop(sseEvent.Data)
+			if t.res.Err != nil {
+				return t.res
 			}
 
 		case "message_delta":
-			handleMessageDelta(sseEvent.Data, res)
-			if res.Err != nil {
-				return res
+			t.handleMessageDelta(sseEvent.Data)
+			if t.res.Err != nil {
+				return t.res
 			}
 
 		case "message_stop":
-			toolWG.Wait()
-			res.ToolResults = buildToolResults(results, toolUses)
+			t.toolWG.Wait()
+			t.res.ToolResults = t.buildToolResults()
 
 		case "error":
-			handleAPIError(sseEvent.Data, res)
-			return res
+			t.handleAPIError(sseEvent.Data)
+			return t.res
 
 		case "ping":
 			// heartbeat — ignore
@@ -231,26 +243,26 @@ func processStream(ctx context.Context, stream *apiclient.Stream, p Params, even
 	}
 
 	// Build assistant message
-	blocks := make([]types.ContentBlock, 0, len(accBlocks))
-	for _, ab := range accBlocks {
+	blocks := make([]types.ContentBlock, 0, len(t.accBlocks))
+	for _, ab := range t.accBlocks {
 		blocks = append(blocks, ab.block)
 	}
-	res.AssistantMsg = types.NewAssistantMessage(blocks)
-	res.ToolUses = toolUses
+	t.res.AssistantMsg = types.NewMessage("assistant", blocks)
+	t.res.ToolUses = t.toolUses
 
-	toolWG.Wait()
-	if len(res.ToolResults) == 0 && len(toolUses) > 0 {
-		res.ToolResults = buildToolResults(results, toolUses)
+	t.toolWG.Wait()
+	if len(t.res.ToolResults) == 0 && len(t.toolUses) > 0 {
+		t.res.ToolResults = t.buildToolResults()
 	}
 
-	return res
+	return t.res
 }
 
 // ---------------------------------------------------------------------------
 // SSE event handlers
 // ---------------------------------------------------------------------------
 
-func handleMessageStart(data json.RawMessage, res *TurnResultExt) {
+func (t *turn) handleMessageStart(data json.RawMessage) {
 	var msgData struct {
 		Message struct {
 			Usage struct {
@@ -259,35 +271,35 @@ func handleMessageStart(data json.RawMessage, res *TurnResultExt) {
 		} `json:"message"`
 	}
 	if err := json.Unmarshal(data, &msgData); err != nil {
-		res.Err = fmt.Errorf("parse message_start: %w", err)
+		t.res.Err = fmt.Errorf("parse message_start: %w", err)
 		return
 	}
-	res.Usage.InputTokens = msgData.Message.Usage.InputTokens
+	t.res.Usage.InputTokens = msgData.Message.Usage.InputTokens
 }
 
-func handleBlockStart(data json.RawMessage, accBlocks *[]accBlock, events chan<- Event, res *TurnResultExt) {
+func (t *turn) handleBlockStart(data json.RawMessage) {
 	var startData struct {
 		Index        int             `json:"index"`
 		ContentBlock json.RawMessage `json:"content_block"`
 	}
 	if err := json.Unmarshal(data, &startData); err != nil {
-		res.Err = fmt.Errorf("parse content_block_start: %w", err)
+		t.res.Err = fmt.Errorf("parse content_block_start: %w", err)
 		return
 	}
 
-	block, err := types.ParseStartContentBlock(startData.ContentBlock)
-	if err != nil {
-		res.Err = fmt.Errorf("parse block: %w", err)
+	var block types.ContentBlock
+	if err := block.ParseStart(startData.ContentBlock); err != nil {
+		t.res.Err = fmt.Errorf("parse block: %w", err)
 		return
 	}
 
-	for len(*accBlocks) <= startData.Index {
-		*accBlocks = append(*accBlocks, accBlock{})
+	for len(t.accBlocks) <= startData.Index {
+		t.accBlocks = append(t.accBlocks, accBlock{})
 	}
-	(*accBlocks)[startData.Index] = accBlock{block: block}
+	t.accBlocks[startData.Index] = accBlock{block: block}
 
 	if block.Type == types.ContentBlockToolUse {
-		events <- Event{
+		t.events <- Event{
 			Type:     EventToolUseStart,
 			ToolID:   block.ToolUseID,
 			ToolName: block.Name,
@@ -295,7 +307,7 @@ func handleBlockStart(data json.RawMessage, accBlocks *[]accBlock, events chan<-
 	}
 }
 
-func handleBlockDelta(data json.RawMessage, accBlocks *[]accBlock, events chan<- Event, res *TurnResultExt) {
+func (t *turn) handleBlockDelta(data json.RawMessage) {
 	var deltaData struct {
 		Index int `json:"index"`
 		Delta struct {
@@ -305,50 +317,50 @@ func handleBlockDelta(data json.RawMessage, accBlocks *[]accBlock, events chan<-
 		} `json:"delta"`
 	}
 	if err := json.Unmarshal(data, &deltaData); err != nil {
-		res.Err = fmt.Errorf("parse delta: %w", err)
+		t.res.Err = fmt.Errorf("parse delta: %w", err)
 		return
 	}
 
 	idx := deltaData.Index
-	for len(*accBlocks) <= idx {
-		*accBlocks = append(*accBlocks, accBlock{})
+	for len(t.accBlocks) <= idx {
+		t.accBlocks = append(t.accBlocks, accBlock{})
 	}
 
 	switch deltaData.Delta.Type {
 	case "text_delta":
-		(*accBlocks)[idx].block.Type = types.ContentBlockText
-		(*accBlocks)[idx].block.Text += deltaData.Delta.Text
-		events <- Event{Type: EventTextChunk, Text: deltaData.Delta.Text}
+		t.accBlocks[idx].block.Type = types.ContentBlockText
+		t.accBlocks[idx].block.Text += deltaData.Delta.Text
+		t.events <- Event{Type: EventTextChunk, Text: deltaData.Delta.Text}
 
+	case "thinking_delta":
+		t.accBlocks[idx].block.Type = types.ContentBlockThinking
+		t.accBlocks[idx].block.Thinking += deltaData.Delta.Text
 
-		case "thinking_delta":
-			(*accBlocks)[idx].block.Type = types.ContentBlockThinking
-			(*accBlocks)[idx].block.Thinking += deltaData.Delta.Text
 	case "input_json_delta":
-		(*accBlocks)[idx].jsonSB.WriteString(deltaData.Delta.PartialJSON)
-		events <- Event{
+		t.accBlocks[idx].jsonSB.WriteString(deltaData.Delta.PartialJSON)
+		t.events <- Event{
 			Type:       EventToolUseInput,
-			ToolID:     (*accBlocks)[idx].block.ToolUseID,
+			ToolID:     t.accBlocks[idx].block.ToolUseID,
 			InputDelta: deltaData.Delta.PartialJSON,
 		}
 	}
 }
 
-func handleBlockStop(data json.RawMessage, accBlocks *[]accBlock, events chan<- Event, res *TurnResultExt) *ToolUseInfo {
+func (t *turn) handleBlockStop(data json.RawMessage) {
 	var stopData struct {
 		Index int `json:"index"`
 	}
 	if err := json.Unmarshal(data, &stopData); err != nil {
-		res.Err = fmt.Errorf("parse content_block_stop: %w", err)
-		return nil
+		t.res.Err = fmt.Errorf("parse content_block_stop: %w", err)
+		return
 	}
 
 	idx := stopData.Index
-	if idx >= len(*accBlocks) {
-		return nil
+	if idx >= len(t.accBlocks) {
+		return
 	}
 
-	ab := &(*accBlocks)[idx]
+	ab := &t.accBlocks[idx]
 
 	// Finalize tool_use input from accumulated JSON deltas
 	if ab.block.Type == types.ContentBlockToolUse && ab.jsonSB.Len() > 0 {
@@ -359,27 +371,33 @@ func handleBlockStop(data json.RawMessage, accBlocks *[]accBlock, events chan<- 
 	}
 
 	if ab.block.Type != types.ContentBlockToolUse {
-		return nil
+		return
 	}
 
-	tu := &ToolUseInfo{
+	tu := ToolUseInfo{
 		Index: idx,
 		ID:    ab.block.ToolUseID,
 		Name:  ab.block.Name,
 		Input: ab.block.Input,
 	}
 
-	events <- Event{
+	t.events <- Event{
 		Type:     EventToolUseDone,
 		ToolID:   tu.ID,
 		ToolName: tu.Name,
 		Input:    tu.Input,
 	}
 
-	return tu
+	// Launch tool execution immediately
+	t.toolUses = append(t.toolUses, tu)
+	t.toolWG.Add(1)
+	go func(tu2 ToolUseInfo) {
+		defer t.toolWG.Done()
+		t.executeAndCollect(tu2)
+	}(tu)
 }
 
-func handleMessageDelta(data json.RawMessage, res *TurnResultExt) {
+func (t *turn) handleMessageDelta(data json.RawMessage) {
 	var deltaMsg struct {
 		Delta struct {
 			StopReason string `json:"stop_reason"`
@@ -389,14 +407,14 @@ func handleMessageDelta(data json.RawMessage, res *TurnResultExt) {
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(data, &deltaMsg); err != nil {
-		res.Err = fmt.Errorf("parse message_delta: %w", err)
+		t.res.Err = fmt.Errorf("parse message_delta: %w", err)
 		return
 	}
-	res.StopReason = deltaMsg.Delta.StopReason
-	res.Usage.OutputTokens = deltaMsg.Usage.OutputTokens
+	t.res.StopReason = deltaMsg.Delta.StopReason
+	t.res.Usage.OutputTokens = deltaMsg.Usage.OutputTokens
 }
 
-func handleAPIError(data json.RawMessage, res *TurnResultExt) {
+func (t *turn) handleAPIError(data json.RawMessage) {
 	var errData struct {
 		Error struct {
 			Type    string `json:"type"`
@@ -404,40 +422,33 @@ func handleAPIError(data json.RawMessage, res *TurnResultExt) {
 		} `json:"error"`
 	}
 	if err := json.Unmarshal(data, &errData); err == nil {
-		res.Err = fmt.Errorf("API error [%s]: %s", errData.Error.Type, errData.Error.Message)
+		t.res.Err = fmt.Errorf("API error [%s]: %s", errData.Error.Type, errData.Error.Message)
 		return
 	}
-	res.Err = fmt.Errorf("API error: %s", string(data))
+	t.res.Err = fmt.Errorf("API error: %s", string(data))
 }
 
 // ---------------------------------------------------------------------------
 // Tool execution helpers
 // ---------------------------------------------------------------------------
 
-func executeAndCollect(
-	ctx context.Context,
-	p Params,
-	tu ToolUseInfo,
-	events chan<- Event,
-	toolMu *sync.Mutex,
-	results *[]toolResultItem,
-) {
-	events <- Event{
+func (t *turn) executeAndCollect(tu ToolUseInfo) {
+	t.events <- Event{
 		Type:     EventToolExecStart,
 		ToolID:   tu.ID,
 		ToolName: tu.Name,
 	}
 
-	result, isError, err := p.ExecuteTool(ctx, tu.Name, tu.Input, tu.ID)
+	result, isError, err := t.runner.params.ExecuteTool(t.ctx, tu.Name, tu.Input, tu.ID)
 	if err != nil {
-		events <- Event{
+		t.events <- Event{
 			Type:    EventToolExecResult,
 			ToolID:  tu.ID,
 			IsError: true,
 			Result:  fmt.Sprintf("execution error: %v", err),
 		}
-		toolMu.Lock()
-		*results = append(*results, toolResultItem{
+		t.toolMu.Lock()
+		t.results = append(t.results, toolResultItem{
 			Index: tu.Index,
 			Block: types.ContentBlock{
 				Type:      types.ContentBlockToolResult,
@@ -446,19 +457,19 @@ func executeAndCollect(
 				IsError:   true,
 			},
 		})
-		toolMu.Unlock()
+		t.toolMu.Unlock()
 		return
 	}
 
-	events <- Event{
+	t.events <- Event{
 		Type:    EventToolExecResult,
 		ToolID:  tu.ID,
 		Result:  result,
 		IsError: isError,
 	}
 
-	toolMu.Lock()
-	*results = append(*results, toolResultItem{
+	t.toolMu.Lock()
+	t.results = append(t.results, toolResultItem{
 		Index: tu.Index,
 		Block: types.ContentBlock{
 			Type:      types.ContentBlockToolResult,
@@ -467,22 +478,20 @@ func executeAndCollect(
 			IsError:   isError,
 		},
 	})
-	toolMu.Unlock()
+	t.toolMu.Unlock()
 }
 
-func buildToolResults(items []toolResultItem, toolUses []ToolUseInfo) []types.ContentBlock {
-	// Map completed results by their SSE content block index.
-	resultByIndex := make(map[int]types.ContentBlock, len(items))
-	for _, item := range items {
+func (t *turn) buildToolResults() []types.ContentBlock {
+	resultByIndex := make(map[int]types.ContentBlock, len(t.results))
+	for _, item := range t.results {
 		resultByIndex[item.Index] = item.Block
 	}
 
-	out := make([]types.ContentBlock, len(toolUses))
-	for i, tu := range toolUses {
+	out := make([]types.ContentBlock, len(t.toolUses))
+	for i, tu := range t.toolUses {
 		if b, ok := resultByIndex[tu.Index]; ok {
 			out[i] = b
 		} else {
-			// 有的工具调用没有返回结果，这里必须要补齐id，否则api会报错
 			out[i] = types.ContentBlock{
 				Type:      types.ContentBlockToolResult,
 				ToolUseID: tu.ID,
@@ -491,12 +500,14 @@ func buildToolResults(items []toolResultItem, toolUses []ToolUseInfo) []types.Co
 			}
 		}
 	}
-
-	fmt.Printf("[DEBUG REQUEST] buildToolResults: toolUses=%d results=%d out=%+v\n", len(toolUses), len(items), out)
 	return out
 }
 
-func handleInterrupt(res *TurnResultExt, events chan<- Event) *TurnResultExt {
+// ---------------------------------------------------------------------------
+// Interrupt handling
+// ---------------------------------------------------------------------------
+
+func (r *Runner) handleInterrupt(res *TurnResultExt, events chan<- Event) *TurnResultExt {
 	if res != nil && len(res.ToolUses) > 0 && len(res.ToolResults) < len(res.ToolUses) {
 		for i := len(res.ToolResults); i < len(res.ToolUses); i++ {
 			tu := res.ToolUses[i]
@@ -519,6 +530,10 @@ func handleInterrupt(res *TurnResultExt, events chan<- Event) *TurnResultExt {
 	return nil
 }
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 func extractMessages(states []MessageState) []types.Message {
 	out := make([]types.Message, 0, len(states))
 	for _, s := range states {
@@ -532,6 +547,6 @@ func appendToolResults(states []MessageState, results []types.ContentBlock) []Me
 		return states
 	}
 	return append(states, MessageState{
-		Message: types.NewToolResultMessage(results),
+		Message: types.NewMessage("user", results),
 	})
 }

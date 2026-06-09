@@ -59,7 +59,7 @@ func (e *QueryEngine) SubmitMessage(ctx context.Context, prompt string) (<-chan 
 
 	// Append user message
 	e.messages = append(e.messages, query.MessageState{
-		Message: types.NewTextMessage("user", prompt),
+		Message: types.NewMessage("user", []types.ContentBlock{{Type: types.ContentBlockText, Text: prompt}}),
 	})
 
 	// Build params — capture a reference to the MessageState slice
@@ -80,7 +80,7 @@ func (e *QueryEngine) SubmitMessage(ctx context.Context, prompt string) (<-chan 
 			e.mu.Unlock()
 		}()
 
-		query.Run(turnCtx, query.Params{
+		runner := query.NewRunner(query.Params{
 			Messages:     snapshot,
 			Tools:        e.config.Tools,
 			SystemPrompt: e.config.SystemPrompt,
@@ -88,9 +88,10 @@ func (e *QueryEngine) SubmitMessage(ctx context.Context, prompt string) (<-chan 
 			Model:        e.config.Model,
 			BaseURL:      e.config.BaseURL,
 			ExecuteTool:  e.executeToolFn(),
-		}, events)
+		})
+		runner.Run(turnCtx, events)
 
-		// Capture final messages — query.Run modifies the slice in-place
+		// Capture final messages — Runner.Run modifies the slice in-place
 		e.mu.Lock()
 		e.messages = snapshot
 		e.mu.Unlock()

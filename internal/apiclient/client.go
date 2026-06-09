@@ -53,11 +53,9 @@ func (s *Stream) Recv() (*SSEEvent, error) {
 			return event, nil
 
 		case line == "":
-			// SSE blank line separator — ignore for our format
 			continue
 
 		default:
-			// Lines without event/data prefix (e.g. ":" comments / keepalive)
 			continue
 		}
 	}
@@ -72,12 +70,26 @@ func (s *Stream) Close() error {
 	return nil
 }
 
-// StreamMessages establishes a streaming connection to the Anthropic API.
-func StreamMessages(ctx context.Context, apiKey, baseURL string, req types.APIRequest) (*Stream, error) {
+// Client manages HTTP connections to the Anthropic-compatible API.
+type Client struct {
+	apiKey  string
+	baseURL string
+	http    *http.Client
+}
+
+func NewClient(apiKey, baseURL string) *Client {
 	if baseURL == "" {
 		baseURL = DefaultBaseURL
 	}
+	return &Client{
+		apiKey:  apiKey,
+		baseURL: baseURL,
+		http:    http.DefaultClient,
+	}
+}
 
+// StreamMessages establishes a streaming connection.
+func (c *Client) StreamMessages(ctx context.Context, req types.APIRequest) (*Stream, error) {
 	req.Stream = true
 
 	body, err := json.Marshal(req)
@@ -85,7 +97,7 @@ func StreamMessages(ctx context.Context, apiKey, baseURL string, req types.APIRe
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/v1/messages", bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/messages", bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
@@ -93,12 +105,12 @@ func StreamMessages(ctx context.Context, apiKey, baseURL string, req types.APIRe
 	httpReq.Header.Set("Content-Type", "application/json")
 	// Both auth headers for compatibility (Anthropic SDK uses x-api-key,
 	// DeepSeek uses Authorization: Bearer).
-	httpReq.Header.Set("x-api-key", apiKey)
-	httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+	httpReq.Header.Set("x-api-key", c.apiKey)
+	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
 	httpReq.Header.Set("anthropic-version", "2023-06-01")
 	httpReq.Header.Set("Accept", "text/event-stream")
 
-	resp, err := http.DefaultClient.Do(httpReq)
+	resp, err := c.http.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("http request: %w", err)
 	}

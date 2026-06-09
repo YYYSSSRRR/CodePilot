@@ -7,10 +7,10 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 
+	"github.com/YYYSSSRRR/codepilot/internal/config"
 	"github.com/YYYSSSRRR/codepilot/internal/engine"
 	"github.com/YYYSSSRRR/codepilot/internal/permissions"
 	"github.com/YYYSSSRRR/codepilot/internal/query"
@@ -18,56 +18,47 @@ import (
 	"github.com/YYYSSSRRR/codepilot/internal/tools"
 )
 
-const defaultModel = "deepseek-v4-flash"
-
 func main() {
-	apiKey := os.Getenv("ANTHROPIC_API_KEY")
-	if apiKey == "" {
-		fmt.Fprintln(os.Stderr, "Error: ANTHROPIC_API_KEY environment variable not set")
-		os.Exit(1)
-	}
-
-	baseURL := os.Getenv("ANTHROPIC_BASE_URL")
-	if baseURL == "" {
-		baseURL = "https://api.deepseek.com/anthropic"
-	}
-
-	wd, err := os.Getwd()
+	cfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
+	fmt.Printf("Permission mode: %s (%d rules)\n", cfg.Settings.PermissionMode, len(cfg.Settings.PermissionRules))
 
-	// Load settings from .codepilot/settings.json
-	settings, err := permissions.LoadSettings(wd)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: could not load settings: %v\n", err)
-		settings = permissions.Default()
-	}
-	fmt.Printf("Permission mode: %s (%d rules)\n", settings.PermissionMode, len(settings.PermissionRules))
-
-	// Register tools
 	reg := tool.NewRegistry(
 		&tools.BashTool{},
 		&tools.ReadTool{},
 		&tools.WriteTool{},
 	)
 
-	// Build engine
-	settingsPath := filepath.Join(wd, ".codepilot", "settings.json")
 	eng := engine.New(engine.Config{
-		Model:        defaultModel,
-		SystemPrompt: defaultSystemPrompt(),
-		APIKey:       apiKey,
-		BaseURL:      baseURL,
+		Model:        cfg.Model,
+		SystemPrompt: defaultSystemPrompt(cfg.WorkingDir),
+		APIKey:       cfg.APIKey,
+		BaseURL:      cfg.BaseURL,
 		Tools:        reg,
-		Permissions:  permissions.NewChecker(settings, reg),
+		Permissions:  permissions.NewChecker(cfg.Settings, reg),
 		OnPermissionAsk: func(ctx context.Context, toolName string, input map[string]any, _ string, reason string) permissions.Decision {
-			return promptPermission(toolName, input, reason, settingsPath)
+			return promptPermission(toolName, input, reason, cfg.SettingsPath)
 		},
 	})
 
-	// Signal handling
+	app := &App{
+		engine: eng,
+		cfg:    cfg,
+	}
+	app.Run()
+}
+
+// App is the CLI application.
+type App struct {
+	engine *engine.QueryEngine
+	cfg    *config.Config
+}
+
+// Run starts the CLI event loop.
+func (app *App) Run() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -75,9 +66,9 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		if eng.IsRunning() {
+		if app.engine.IsRunning() {
 			fmt.Println("\n⏳ Interrupting... (waiting for current tool to complete)")
-			eng.Interrupt()
+			app.engine.Interrupt()
 		} else {
 			cancel()
 		}
@@ -102,7 +93,7 @@ func main() {
 			fmt.Println("Goodbye!")
 			return
 		case input == "/reset":
-			eng.Reset()
+			app.engine.Reset()
 			fmt.Println("Conversation reset.")
 			continue
 		case input == "/help":
@@ -110,7 +101,7 @@ func main() {
 			continue
 		}
 
-		eventCh, err := eng.SubmitMessage(ctx, input)
+		eventCh, err := app.engine.SubmitMessage(ctx, input)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			continue
@@ -145,7 +136,6 @@ func renderEvents(ctx context.Context, eventCh <-chan query.Event) {
 				fmt.Println()
 
 			case query.EventToolExecStart:
-				// Tool is executing — shown inline with the tool use info
 				fmt.Println()
 
 			case query.EventToolExecResult:
@@ -163,11 +153,7 @@ func renderEvents(ctx context.Context, eventCh <-chan query.Event) {
 				fmt.Println()
 
 			case query.EventTurnComplete:
-				// Round complete — next ReAct turn may follow
-
 			case query.EventQueryDone:
-				// Entire conversation turn done
-
 			case query.EventError:
 				fmt.Fprintf(os.Stderr, "\n\033[31mError: %v\033[0m\n", event.Err)
 			}
@@ -244,7 +230,6 @@ func inputContentPattern(toolName string, input map[string]any) string {
 	switch toolName {
 	case "Bash":
 		if cmd, ok := input["command"].(string); ok {
-			// Use the full command as the pattern
 			if len(cmd) > 80 {
 				return cmd[:80] + "*"
 			}
@@ -255,7 +240,6 @@ func inputContentPattern(toolName string, input map[string]any) string {
 }
 
 func writeRuleToFile(path string, rule permissions.PermissionRule) {
-	// Read existing
 	data, err := os.ReadFile(path)
 	if err != nil {
 		data = []byte("{}")
@@ -294,7 +278,7 @@ func printHelp() {
 	fmt.Println("Press Ctrl+C to interrupt the current response.")
 }
 
-func defaultSystemPrompt() string {
+func defaultSystemPrompt(wd string) string {
 	return `You are CodePilot, an AI coding assistant. You help users with software engineering tasks.
 You have access to tools that let you execute bash commands, read files, and write files.
 
@@ -305,17 +289,5 @@ When using tools:
 
 Be concise and helpful. Your responses should be clear and actionable.
 
-Working directory: ` + mustGetWD()
-}
-
-func mustGetWD() string {
-	wd, err := os.Getwd()
-	if err != nil {
-		return "."
-	}
-	abs, err := filepath.Abs(wd)
-	if err != nil {
-		return wd
-	}
-	return abs
+Working directory: ` + wd
 }

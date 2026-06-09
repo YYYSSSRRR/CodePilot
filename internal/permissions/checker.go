@@ -8,28 +8,6 @@ import (
 	"github.com/YYYSSSRRR/codepilot/internal/tool"
 )
 
-// globMatch reports whether str matches the glob pattern.
-func globMatch(pattern, str string) bool {
-	if pattern == "*" {
-		return true
-	}
-	if strings.HasSuffix(pattern, "*") {
-		prefix := strings.TrimSuffix(pattern, "*")
-		if strings.HasSuffix(pattern, "/**") {
-			dirPrefix := strings.TrimSuffix(pattern, "/**")
-			return str == dirPrefix || strings.HasPrefix(str, dirPrefix+"/")
-		}
-		if strings.HasPrefix(str, prefix) {
-			return true
-		}
-		return false
-	}
-	if strings.Contains(pattern, "*") {
-		return false
-	}
-	return str == pattern
-}
-
 // Checker implements the permission pipeline.
 type Checker struct {
 	settings *Settings
@@ -42,25 +20,25 @@ func NewChecker(settings *Settings, registry *tool.Registry) *Checker {
 
 // Check runs the full permission pipeline for a tool invocation.
 func (c *Checker) Check(ctx context.Context, toolName string, input map[string]any, toolUseID string) Result {
-	content := invocationContent(toolName, input)
+	content := c.invocationContent(toolName, input)
 
 	// Step 1a: Blanket deny — tool name + content="*" (deny all invocations)
-	if hasRule(c.settings.PermissionRules, toolName, "*", BehaviorDeny) {
+	if c.hasRule(toolName, "*", BehaviorDeny) {
 		return Result{Decision: DecisionDeny, Message: "denied by blanket rule"}
 	}
 
 	// Step 1b: Blanket allow — tool name + content="*" (allow all invocations)
-	if hasRule(c.settings.PermissionRules, toolName, "*", BehaviorAllow) {
+	if c.hasRule(toolName, "*", BehaviorAllow) {
 		return Result{Decision: DecisionAllow}
 	}
 
 	// Step 1c: Content-specific deny
-	if content != "" && hasRule(c.settings.PermissionRules, toolName, content, BehaviorDeny) {
+	if content != "" && c.hasRule(toolName, content, BehaviorDeny) {
 		return Result{Decision: DecisionDeny, Message: "denied by rule"}
 	}
 
 	// Step 1d: Content-specific allow
-	if content != "" && hasRule(c.settings.PermissionRules, toolName, content, BehaviorAllow) {
+	if content != "" && c.hasRule(toolName, content, BehaviorAllow) {
 		return Result{Decision: DecisionAllow}
 	}
 
@@ -69,7 +47,7 @@ func (c *Checker) Check(ctx context.Context, toolName string, input map[string]a
 		allowed, behavior, msg, checkErr := pt.CheckPermissions(input)
 		if checkErr == nil && !allowed {
 			return Result{
-				Decision: behaviorToDecision(behavior),
+				Decision: c.behaviorToDecision(behavior),
 				Message:  msg,
 			}
 		}
@@ -78,7 +56,7 @@ func (c *Checker) Check(ctx context.Context, toolName string, input map[string]a
 	// Step 3: Pre-tool hooks (reserved)
 
 	// Step 4: Ask rules — content pattern match
-	if hasRule(c.settings.PermissionRules, toolName, content, BehaviorAsk) {
+	if c.hasRule(toolName, content, BehaviorAsk) {
 		return Result{Decision: DecisionAsk}
 	}
 
@@ -117,8 +95,60 @@ func (c *Checker) isWriteTool(name string) bool {
 	return writeTools[name]
 }
 
+func (c *Checker) hasRule(toolName, content string, behavior RuleBehavior) bool {
+	for _, r := range c.settings.PermissionRules {
+		if r.RuleBehavior != behavior || r.RuleValue.ToolName != toolName {
+			continue
+		}
+		if r.RuleValue.RuleContent == "*" {
+			return true
+		}
+		if content == "" {
+			continue
+		}
+		if c.globMatch(r.RuleValue.RuleContent, content) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Checker) globMatch(pattern, str string) bool {
+	if pattern == "*" {
+		return true
+	}
+	if strings.HasSuffix(pattern, "*") {
+		prefix := strings.TrimSuffix(pattern, "*")
+		if strings.HasSuffix(pattern, "/**") {
+			dirPrefix := strings.TrimSuffix(pattern, "/**")
+			return str == dirPrefix || strings.HasPrefix(str, dirPrefix+"/")
+		}
+		if strings.HasPrefix(str, prefix) {
+			return true
+		}
+		return false
+	}
+	if strings.Contains(pattern, "*") {
+		return false
+	}
+	return str == pattern
+}
+
+func (c *Checker) behaviorToDecision(b string) Decision {
+	switch b {
+	case "allow":
+		return DecisionAllow
+	case "deny":
+		return DecisionDeny
+	case "ask":
+		return DecisionAsk
+	default:
+		return DecisionAsk
+	}
+}
+
 // invocationContent extracts a string representation of the tool's input for pattern matching.
-func invocationContent(toolName string, input map[string]any) string {
+func (c *Checker) invocationContent(toolName string, input map[string]any) string {
 	switch toolName {
 	case "Bash", "execute_bash", "bash":
 		if cmd, ok := input["command"].(string); ok {
@@ -134,40 +164,4 @@ func invocationContent(toolName string, input map[string]any) string {
 		}
 	}
 	return ""
-}
-
-// hasRule checks if any rule matches the given tool, content, and behavior.
-// For blanket matching, pass content="*". For pattern matching, pass the actual content string.
-func hasRule(rules []PermissionRule, toolName, content string, behavior RuleBehavior) bool {
-	for _, r := range rules {
-		if r.RuleBehavior != behavior || r.RuleValue.ToolName != toolName {
-			continue
-		}
-		// Blanket rule
-		if r.RuleValue.RuleContent == "*" {
-			return true
-		}
-		// Empty content can only match blanket rules
-		if content == "" {
-			continue
-		}
-		// Pattern match
-		if globMatch(r.RuleValue.RuleContent, content) {
-			return true
-		}
-	}
-	return false
-}
-
-func behaviorToDecision(b string) Decision {
-	switch b {
-	case "allow":
-		return DecisionAllow
-	case "deny":
-		return DecisionDeny
-	case "ask":
-		return DecisionAsk
-	default:
-		return DecisionAsk
-	}
 }
