@@ -1,5 +1,7 @@
 package query
 
+import "github.com/YYYSSSRRR/codepilot/pkg/types"
+
 // EventType enumerates all possible streaming events emitted by the ReAct loop.
 type EventType int
 
@@ -21,26 +23,29 @@ const (
 type Event struct {
 	Type EventType
 
-	// EventTextChunk
+	// Text chunks
 	Text string
 
-	// EventToolUseStart / EventToolUseDone / EventToolExecStart / EventToolExecResult / EventToolPermissionDenied / EventToolPermissionAsk
+	// Tool identification
 	ToolID   string
 	ToolName string
 
-	// EventToolUseInput
+	// Tool input delta (partial JSON)
 	InputDelta string
 
-	// EventToolUseDone
+	// Tool input (complete at tool_use done)
 	Input map[string]any
 
-	// EventToolExecResult / EventToolPermissionDenied
+	// Tool execution result
 	Result  string
 	IsError bool
 
-	// EventTurnComplete
+	// Turn complete
 	StopReason string
 
-	// EventError
+	// Token usage (set on EventTurnComplete)
+	Usage *types.Usage
+
+	// Error
 	Err error
 }

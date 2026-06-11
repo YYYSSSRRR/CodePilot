@@ -52,11 +52,24 @@ func (t *WriteTool) Call(ctx context.Context, input map[string]any) (string, err
 	return fmt.Sprintf("wrote %d bytes to %s", len(content), absPath), nil
 }
 
+func (t *WriteTool) MaxResultSize() int { return 0 }
+
+func (t *WriteTool) IsConcurrencySafe(input map[string]any) bool { return false }
+
+func (t *WriteTool) IsReadOnly(input map[string]any) bool { return false }
+
 func (t *WriteTool) CheckPermissions(input map[string]any) (bool, string, string, error) {
-	// Writes always need ask in default mode
 	return false, "ask", "this will modify or create a file", nil
 }
 
-func (t *WriteTool) IsWriteOperation(input map[string]any) bool {
-	return true
+func (t *WriteTool) ValidateInput(input map[string]any) error {
+	path, _ := input["path"].(string)
+	if path == "" {
+		return fmt.Errorf("path is required")
+	}
+	_, hasContent := input["content"]
+	if !hasContent {
+		return fmt.Errorf("content is required")
+	}
+	return nil
 }

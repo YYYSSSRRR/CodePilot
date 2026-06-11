@@ -3,14 +3,13 @@ package query
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
-	"sync"
 
-	"github.com/YYYSSSRRR/codepilot/internal/apiclient"
-	"github.com/YYYSSSRRR/codepilot/internal/tool"
-	"github.com/YYYSSSRRR/codepilot/internal/types"
+	"github.com/YYYSSSRRR/codepilot/internal/api"
+	"github.com/YYYSSSRRR/codepilot/pkg/types"
 )
 
 // ToolUseInfo records one tool_use from the assistant.
@@ -21,132 +20,151 @@ type ToolUseInfo struct {
 	Input map[string]any
 }
 
-// ExecuteToolFunc is provided by the engine to execute a tool with permission checks.
-type ExecuteToolFunc func(ctx context.Context, toolName string, input map[string]any, toolUseID string) (string, bool, error)
+// QueryDeps holds injected dependencies for the ReAct loop.
+type QueryDeps struct {
+	CallModel   func(ctx context.Context, req *api.Request) (api.Streamer, error)
+	CanUseTool  func(ctx context.Context, toolName string, input map[string]any, toolUseID string) (bool, string)
+	ExecuteTool func(ctx context.Context, toolName string, input map[string]any) (string, bool, error)
+	Compact     func(messages []types.Message) []types.Message
+	// RecordTranscript persists the current message list after each turn.
+	// Called fire-and-forget from the streaming goroutine.
+	RecordTranscript func(messages []types.Message)
 
-// Params for the ReAct loop.
-type Params struct {
-	Messages     []MessageState
-	Tools        *tool.Registry
-	SystemPrompt string
-	APIKey       string
-	Model        string
-	BaseURL      string
-	ExecuteTool  ExecuteToolFunc
+	// TokenCount returns the total token count for the message list.
+	// Uses exact API usage + local estimation for tail messages.
+	TokenCount func(messages []types.Message) int
+
+	// AutoCompactThreshold returns the token count at which compaction triggers.
+	AutoCompactThreshold func() int
+
+	// EffectiveWindow returns the usable context window (total minus output reservation).
+	EffectiveWindow func() int
 }
-
-// MessageState wraps a message with additional turn metadata.
-type MessageState struct {
-	Message       types.Message
-	TurnCompleted bool
-}
-
-// TurnResult holds the assistant message and tool usage info from one API turn.
-type TurnResult struct {
-	AssistantMsg types.Message
-	ToolUses     []ToolUseInfo
-	StopReason   string
-	Usage        struct {
-		InputTokens  int
-		OutputTokens int
-	}
-}
-
-// TurnResultExt extends TurnResult with execution results and errors.
-type TurnResultExt struct {
-	TurnResult
-	ToolResults []types.ContentBlock
-	Err         error
-}
-
-// toolResultItem pairs a result with its SSE block index for ordering.
-type toolResultItem struct {
-	Index int
-	Block types.ContentBlock
-}
-
-// accBlock accumulates one assistant content block from SSE events.
-type accBlock struct {
-	block  types.ContentBlock
-	jsonSB strings.Builder
-}
-
-// ---------------------------------------------------------------------------
-// Runner — ReAct loop
-// ---------------------------------------------------------------------------
 
 // Runner drives the ReAct loop. Create via NewRunner.
 type Runner struct {
-	params Params
-	client *apiclient.Client
+	deps      QueryDeps
+	system    string
+	model     string
+	maxTokens int
 }
 
-func NewRunner(params Params) *Runner {
+func NewRunner(deps QueryDeps, system, model string, maxTokens int) *Runner {
 	return &Runner{
-		params: params,
-		client: apiclient.NewClient(params.APIKey, params.BaseURL),
+		deps:      deps,
+		system:    system,
+		model:     model,
+		maxTokens: maxTokens,
 	}
 }
 
 // Run starts the ReAct loop. It blocks until the conversation turn is done.
-func (r *Runner) Run(ctx context.Context, events chan<- Event) {
+// Returns the final message list (including assistant responses and tool results).
+func (r *Runner) Run(ctx context.Context, messages []types.Message, tools []types.ToolParam, events chan<- Event) []types.Message {
 	defer close(events)
+
+	turnMsgs := messages
 
 	for turn := 0; ; turn++ {
 		if err := ctx.Err(); err != nil {
 			events <- Event{Type: EventTurnComplete, StopReason: "user_interrupt"}
 			events <- Event{Type: EventQueryDone}
-			return
+			return turnMsgs
 		}
 
-		apiMessages := extractMessages(r.params.Messages)
-		apiReq := types.APIRequest{
-			Model:     r.params.Model,
-			MaxTokens: 8192,
-			System:    r.params.SystemPrompt,
-			Messages:  types.Messages(apiMessages).ToAPI(),
-			Tools:     r.params.Tools.Definitions(),
+		// ── Token budget checks ──────────────────────────────────────
+		if r.deps.TokenCount != nil && r.deps.AutoCompactThreshold != nil {
+			total := r.deps.TokenCount(turnMsgs)
+			threshold := r.deps.AutoCompactThreshold()
+			var hardLimit int
+			if r.deps.EffectiveWindow != nil {
+				hardLimit = r.deps.EffectiveWindow() - 3000
+			}
+
+			// Hard limit: prompt too long
+			if hardLimit > 0 && total >= hardLimit {
+				events <- Event{
+					Type: EventError,
+					Err:  fmt.Errorf("prompt too long: ~%d tokens (limit %d)", total, hardLimit),
+				}
+				events <- Event{Type: EventQueryDone}
+				return turnMsgs
+			}
+
+			// Auto-compact threshold
+			if total >= threshold && r.deps.Compact != nil {
+				turnMsgs = r.deps.Compact(turnMsgs)
+			}
+		} else if r.deps.Compact != nil {
+			// Fallback: compact unconditionally if no token info available
+			turnMsgs = r.deps.Compact(turnMsgs)
 		}
 
-		stream, err := r.client.StreamMessages(ctx, apiReq)
-		if err != nil {
-			events <- Event{Type: EventError, Err: fmt.Errorf("API call: %w", err)}
-			events <- Event{Type: EventQueryDone}
-			return
-		}
-
-		turnResult := r.processStream(ctx, stream, events)
-		stream.Close()
+		// Process a single model turn — streams response and collects tool_uses
+		executor := NewStreamingToolExecutor(r.deps)
+		turnResult := r.processTurn(ctx, turnMsgs, tools, executor, events)
 
 		if turnResult.Err != nil {
-			events <- Event{Type: EventError, Err: turnResult.Err}
-			events <- Event{Type: EventQueryDone}
-			return
-		}
-
-		if err := ctx.Err(); err != nil {
-			turnResult = r.handleInterrupt(turnResult, events)
-			if turnResult == nil {
+			if errors.Is(turnResult.Err, context.Canceled) {
 				events <- Event{Type: EventTurnComplete, StopReason: "user_interrupt"}
 				events <- Event{Type: EventQueryDone}
-				return
+				return turnMsgs
+			}
+			events <- Event{Type: EventError, Err: turnResult.Err}
+			events <- Event{Type: EventQueryDone}
+			return turnMsgs
+		}
+
+		events <- Event{
+			Type:       EventTurnComplete,
+			StopReason: turnResult.StopReason,
+			Usage:      turnResult.AssistantMsg.Usage,
+		}
+
+		// No tool uses — model response is final
+		if len(turnResult.ToolUses) == 0 {
+			if r.deps.RecordTranscript != nil {
+				// Include the final assistant message for transcript completeness
+				complete := turnMsgs
+				if turnResult.AssistantMsg.Role != "" {
+					complete = append(complete, turnResult.AssistantMsg)
+				}
+				r.deps.RecordTranscript(complete)
+			}
+			events <- Event{Type: EventQueryDone}
+			return turnMsgs
+		}
+
+		// Append assistant message to history
+		if turnResult.AssistantMsg.Role != "" {
+			turnMsgs = append(turnMsgs, turnResult.AssistantMsg)
+		}
+
+		// Execute all tools synchronously (one at a time) and emit results
+		allUpdates := executor.ExecuteAll(ctx)
+		for _, update := range allUpdates {
+			events <- Event{
+				Type:    EventToolExecResult,
+				ToolID:  update.ToolUseID,
+				Result:  update.Content,
+				IsError: update.IsError,
 			}
 		}
 
-		events <- Event{Type: EventTurnComplete, StopReason: turnResult.StopReason}
-
-		if len(turnResult.ToolUses) == 0 {
+		// Check for interruption during tool execution
+		if err := ctx.Err(); err != nil {
+			events <- Event{Type: EventTurnComplete, StopReason: "user_interrupt"}
 			events <- Event{Type: EventQueryDone}
-			return
+			return turnMsgs
 		}
 
-		if turnResult.AssistantMsg.Role != "" {
-			r.params.Messages = append(r.params.Messages, MessageState{
-				Message:       turnResult.AssistantMsg,
-				TurnCompleted: true,
-			})
+		// Append tool results as a user message and loop back
+		turnMsgs = append(turnMsgs, types.NewMessage("user", UpdatesToBlocks(allUpdates)))
+
+		// Persist after each complete turn (assistant response + tool results)
+		if r.deps.RecordTranscript != nil {
+			r.deps.RecordTranscript(turnMsgs)
 		}
-		r.params.Messages = appendToolResults(r.params.Messages, turnResult.ToolResults)
 	}
 }
 
@@ -156,29 +174,56 @@ func (r *Runner) Run(ctx context.Context, events chan<- Event) {
 
 type turn struct {
 	ctx       context.Context
-	runner    *Runner
 	events    chan<- Event
 	res       *TurnResultExt
 	accBlocks []accBlock
-	toolMu    sync.Mutex
-	toolWG    sync.WaitGroup
-	results   []toolResultItem
 	toolUses  []ToolUseInfo
+	usage     types.Usage // accumulated across streaming events
 }
 
-func newTurn(ctx context.Context, r *Runner, events chan<- Event) *turn {
+type accBlock struct {
+	block  types.ContentBlock
+	jsonSB strings.Builder
+}
+
+func newTurn(ctx context.Context, events chan<- Event) *turn {
 	return &turn{
 		ctx:    ctx,
-		runner: r,
 		events: events,
-		res: &TurnResultExt{
-			ToolResults: make([]types.ContentBlock, 0),
-		},
+		res:    &TurnResultExt{},
 	}
 }
 
-func (r *Runner) processStream(ctx context.Context, stream *apiclient.Stream, events chan<- Event) *TurnResultExt {
-	t := newTurn(ctx, r, events)
+// TurnResult holds the assistant message and tool usage info from one API turn.
+type TurnResult struct {
+	AssistantMsg types.Message
+	ToolUses     []ToolUseInfo
+	StopReason   string
+	Usage        types.Usage
+}
+
+// TurnResultExt extends TurnResult with errors.
+type TurnResultExt struct {
+	TurnResult
+	Err error
+}
+
+func (r *Runner) processTurn(ctx context.Context, msgs []types.Message, tools []types.ToolParam, executor *StreamingToolExecutor, events chan<- Event) *TurnResultExt {
+	t := newTurn(ctx, events)
+
+	req := api.MarshalRequest(msgs, tools, r.system, r.model, r.maxTokens)
+	stream, err := r.deps.CallModel(ctx, req)
+	if err != nil {
+		t.res.Err = fmt.Errorf("API call: %w", err)
+		return t.res
+	}
+	defer stream.Close()
+
+	// Stream close on cancel to unblock Recv
+	go func() {
+		<-ctx.Done()
+		stream.Close()
+	}()
 
 	for {
 		sseEvent, err := stream.Recv()
@@ -201,59 +246,43 @@ func (r *Runner) processStream(ctx context.Context, stream *apiclient.Stream, ev
 		switch sseEvent.Type {
 		case "message_start":
 			t.handleMessageStart(sseEvent.Data)
-			if t.res.Err != nil {
-				return t.res
-			}
 
 		case "content_block_start":
 			t.handleBlockStart(sseEvent.Data)
-			if t.res.Err != nil {
-				return t.res
-			}
 
 		case "content_block_delta":
 			t.handleBlockDelta(sseEvent.Data)
-			if t.res.Err != nil {
-				return t.res
-			}
 
 		case "content_block_stop":
-			t.handleBlockStop(sseEvent.Data)
-			if t.res.Err != nil {
-				return t.res
-			}
+			t.handleBlockStop(sseEvent.Data, executor)
 
 		case "message_delta":
 			t.handleMessageDelta(sseEvent.Data)
-			if t.res.Err != nil {
-				return t.res
-			}
 
 		case "message_stop":
-			t.toolWG.Wait()
-			t.res.ToolResults = t.buildToolResults()
+			// All content blocks received
 
 		case "error":
 			t.handleAPIError(sseEvent.Data)
 			return t.res
 
 		case "ping":
-			// heartbeat — ignore
+			// heartbeat
+		}
+
+		if t.res.Err != nil {
+			return t.res
 		}
 	}
 
-	// Build assistant message
+	// Build assistant message from accumulated blocks
 	blocks := make([]types.ContentBlock, 0, len(t.accBlocks))
 	for _, ab := range t.accBlocks {
 		blocks = append(blocks, ab.block)
 	}
 	t.res.AssistantMsg = types.NewMessage("assistant", blocks)
+	t.res.AssistantMsg.Usage = &t.usage
 	t.res.ToolUses = t.toolUses
-
-	t.toolWG.Wait()
-	if len(t.res.ToolResults) == 0 && len(t.toolUses) > 0 {
-		t.res.ToolResults = t.buildToolResults()
-	}
 
 	return t.res
 }
@@ -262,33 +291,41 @@ func (r *Runner) processStream(ctx context.Context, stream *apiclient.Stream, ev
 // SSE event handlers
 // ---------------------------------------------------------------------------
 
-func (t *turn) handleMessageStart(data json.RawMessage) {
+func (t *turn) handleMessageStart(data any) {
+	raw, ok := data.(json.RawMessage)
+	if !ok {
+		return
+	}
 	var msgData struct {
 		Message struct {
-			Usage struct {
-				InputTokens int `json:"input_tokens"`
-			} `json:"usage"`
+			Usage types.Usage `json:"usage"`
 		} `json:"message"`
 	}
-	if err := json.Unmarshal(data, &msgData); err != nil {
+	if err := json.Unmarshal(raw, &msgData); err != nil {
 		t.res.Err = fmt.Errorf("parse message_start: %w", err)
 		return
 	}
-	t.res.Usage.InputTokens = msgData.Message.Usage.InputTokens
+	t.usage.InputTokens = msgData.Message.Usage.InputTokens
+	t.usage.CacheCreationInputTokens = msgData.Message.Usage.CacheCreationInputTokens
+	t.usage.CacheReadInputTokens = msgData.Message.Usage.CacheReadInputTokens
 }
 
-func (t *turn) handleBlockStart(data json.RawMessage) {
+func (t *turn) handleBlockStart(data any) {
+	raw, ok := data.(json.RawMessage)
+	if !ok {
+		return
+	}
 	var startData struct {
 		Index        int             `json:"index"`
 		ContentBlock json.RawMessage `json:"content_block"`
 	}
-	if err := json.Unmarshal(data, &startData); err != nil {
+	if err := json.Unmarshal(raw, &startData); err != nil {
 		t.res.Err = fmt.Errorf("parse content_block_start: %w", err)
 		return
 	}
 
 	var block types.ContentBlock
-	if err := block.ParseStart(startData.ContentBlock); err != nil {
+	if err := parseBlockStart(&block, startData.ContentBlock); err != nil {
 		t.res.Err = fmt.Errorf("parse block: %w", err)
 		return
 	}
@@ -307,7 +344,11 @@ func (t *turn) handleBlockStart(data json.RawMessage) {
 	}
 }
 
-func (t *turn) handleBlockDelta(data json.RawMessage) {
+func (t *turn) handleBlockDelta(data any) {
+	raw, ok := data.(json.RawMessage)
+	if !ok {
+		return
+	}
 	var deltaData struct {
 		Index int `json:"index"`
 		Delta struct {
@@ -316,7 +357,7 @@ func (t *turn) handleBlockDelta(data json.RawMessage) {
 			PartialJSON string `json:"partial_json"`
 		} `json:"delta"`
 	}
-	if err := json.Unmarshal(data, &deltaData); err != nil {
+	if err := json.Unmarshal(raw, &deltaData); err != nil {
 		t.res.Err = fmt.Errorf("parse delta: %w", err)
 		return
 	}
@@ -346,11 +387,15 @@ func (t *turn) handleBlockDelta(data json.RawMessage) {
 	}
 }
 
-func (t *turn) handleBlockStop(data json.RawMessage) {
+func (t *turn) handleBlockStop(data any, executor *StreamingToolExecutor) {
+	raw, ok := data.(json.RawMessage)
+	if !ok {
+		return
+	}
 	var stopData struct {
 		Index int `json:"index"`
 	}
-	if err := json.Unmarshal(data, &stopData); err != nil {
+	if err := json.Unmarshal(raw, &stopData); err != nil {
 		t.res.Err = fmt.Errorf("parse content_block_stop: %w", err)
 		return
 	}
@@ -388,16 +433,17 @@ func (t *turn) handleBlockStop(data json.RawMessage) {
 		Input:    tu.Input,
 	}
 
-	// Launch tool execution immediately
 	t.toolUses = append(t.toolUses, tu)
-	t.toolWG.Add(1)
-	go func(tu2 ToolUseInfo) {
-		defer t.toolWG.Done()
-		t.executeAndCollect(tu2)
-	}(tu)
+
+	// Queue tool for concurrent execution
+	executor.AddTool(tu)
 }
 
-func (t *turn) handleMessageDelta(data json.RawMessage) {
+func (t *turn) handleMessageDelta(data any) {
+	raw, ok := data.(json.RawMessage)
+	if !ok {
+		return
+	}
 	var deltaMsg struct {
 		Delta struct {
 			StopReason string `json:"stop_reason"`
@@ -406,147 +452,65 @@ func (t *turn) handleMessageDelta(data json.RawMessage) {
 			OutputTokens int `json:"output_tokens"`
 		} `json:"usage"`
 	}
-	if err := json.Unmarshal(data, &deltaMsg); err != nil {
+	if err := json.Unmarshal(raw, &deltaMsg); err != nil {
 		t.res.Err = fmt.Errorf("parse message_delta: %w", err)
 		return
 	}
 	t.res.StopReason = deltaMsg.Delta.StopReason
-	t.res.Usage.OutputTokens = deltaMsg.Usage.OutputTokens
+	t.usage.OutputTokens = deltaMsg.Usage.OutputTokens
 }
 
-func (t *turn) handleAPIError(data json.RawMessage) {
+func (t *turn) handleAPIError(data any) {
+	raw, ok := data.(json.RawMessage)
+	if !ok {
+		return
+	}
 	var errData struct {
 		Error struct {
 			Type    string `json:"type"`
 			Message string `json:"message"`
 		} `json:"error"`
 	}
-	if err := json.Unmarshal(data, &errData); err == nil {
+	if err := json.Unmarshal(raw, &errData); err == nil {
 		t.res.Err = fmt.Errorf("API error [%s]: %s", errData.Error.Type, errData.Error.Message)
 		return
 	}
-	t.res.Err = fmt.Errorf("API error: %s", string(data))
+	t.res.Err = fmt.Errorf("API error: %s", string(raw))
 }
 
 // ---------------------------------------------------------------------------
-// Tool execution helpers
+// Content block parsing
 // ---------------------------------------------------------------------------
 
-func (t *turn) executeAndCollect(tu ToolUseInfo) {
-	t.events <- Event{
-		Type:     EventToolExecStart,
-		ToolID:   tu.ID,
-		ToolName: tu.Name,
+func parseBlockStart(b *types.ContentBlock, raw json.RawMessage) error {
+	var wire struct {
+		Type     types.ContentBlockType `json:"type"`
+		Text     string                 `json:"text"`
+		ID       string                 `json:"id"`
+		Name     string                 `json:"name"`
+		Input    any                    `json:"input"`
+		Thinking string                 `json:"thinking"`
 	}
-
-	result, isError, err := t.runner.params.ExecuteTool(t.ctx, tu.Name, tu.Input, tu.ID)
-	if err != nil {
-		t.events <- Event{
-			Type:    EventToolExecResult,
-			ToolID:  tu.ID,
-			IsError: true,
-			Result:  fmt.Sprintf("execution error: %v", err),
-		}
-		t.toolMu.Lock()
-		t.results = append(t.results, toolResultItem{
-			Index: tu.Index,
-			Block: types.ContentBlock{
-				Type:      types.ContentBlockToolResult,
-				ToolUseID: tu.ID,
-				Content:   fmt.Sprintf("execution error: %v", err),
-				IsError:   true,
-			},
-		})
-		t.toolMu.Unlock()
-		return
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		return fmt.Errorf("parse content block: %w", err)
 	}
-
-	t.events <- Event{
-		Type:    EventToolExecResult,
-		ToolID:  tu.ID,
-		Result:  result,
-		IsError: isError,
-	}
-
-	t.toolMu.Lock()
-	t.results = append(t.results, toolResultItem{
-		Index: tu.Index,
-		Block: types.ContentBlock{
-			Type:      types.ContentBlockToolResult,
-			ToolUseID: tu.ID,
-			Content:   result,
-			IsError:   isError,
-		},
-	})
-	t.toolMu.Unlock()
-}
-
-func (t *turn) buildToolResults() []types.ContentBlock {
-	resultByIndex := make(map[int]types.ContentBlock, len(t.results))
-	for _, item := range t.results {
-		resultByIndex[item.Index] = item.Block
-	}
-
-	out := make([]types.ContentBlock, len(t.toolUses))
-	for i, tu := range t.toolUses {
-		if b, ok := resultByIndex[tu.Index]; ok {
-			out[i] = b
-		} else {
-			out[i] = types.ContentBlock{
-				Type:      types.ContentBlockToolResult,
-				ToolUseID: tu.ID,
-				Content:   "no result available",
-				IsError:   true,
+	b.Type = wire.Type
+	switch wire.Type {
+	case types.ContentBlockText:
+		b.Text = wire.Text
+	case types.ContentBlockToolUse:
+		b.ToolUseID = wire.ID
+		b.Name = wire.Name
+		if wire.Input != nil {
+			if m, ok := wire.Input.(map[string]any); ok {
+				b.Input = m
 			}
 		}
-	}
-	return out
-}
-
-// ---------------------------------------------------------------------------
-// Interrupt handling
-// ---------------------------------------------------------------------------
-
-func (r *Runner) handleInterrupt(res *TurnResultExt, events chan<- Event) *TurnResultExt {
-	if res != nil && len(res.ToolUses) > 0 && len(res.ToolResults) < len(res.ToolUses) {
-		for i := len(res.ToolResults); i < len(res.ToolUses); i++ {
-			tu := res.ToolUses[i]
-			events <- Event{
-				Type:    EventToolExecResult,
-				ToolID:  tu.ID,
-				IsError: true,
-				Result:  "Interrupted by user",
-			}
-			res.ToolResults = append(res.ToolResults, types.ContentBlock{
-				Type:      types.ContentBlockToolResult,
-				ToolUseID: tu.ID,
-				Content:   "Interrupted by user",
-				IsError:   true,
-			})
+		if b.Input == nil {
+			b.Input = make(map[string]any)
 		}
-		res.StopReason = "user_interrupt"
-		return res
+	case types.ContentBlockThinking:
+		b.Thinking = wire.Thinking
 	}
 	return nil
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-func extractMessages(states []MessageState) []types.Message {
-	out := make([]types.Message, 0, len(states))
-	for _, s := range states {
-		out = append(out, s.Message)
-	}
-	return out
-}
-
-func appendToolResults(states []MessageState, results []types.ContentBlock) []MessageState {
-	if len(results) == 0 {
-		return states
-	}
-	return append(states, MessageState{
-		Message: types.NewMessage("user", results),
-	})
 }

@@ -44,15 +44,24 @@ func (t *ReadTool) Call(ctx context.Context, input map[string]any) (string, erro
 	return string(data), nil
 }
 
+func (t *ReadTool) MaxResultSize() int { return 0 }
+
+func (t *ReadTool) IsConcurrencySafe(input map[string]any) bool { return true }
+
+func (t *ReadTool) IsReadOnly(input map[string]any) bool { return true }
+
 func (t *ReadTool) CheckPermissions(input map[string]any) (bool, string, string, error) {
 	path, _ := input["path"].(string)
 	if path == "" {
 		return false, "deny", "path is required", nil
 	}
-	// Reads are generally allowed — the pipeline's mode default handles this
-	return true, "allow", "", nil
+	return true, "", "", nil
 }
 
-func (t *ReadTool) IsWriteOperation(input map[string]any) bool {
-	return false
+func (t *ReadTool) ValidateInput(input map[string]any) error {
+	path, _ := input["path"].(string)
+	if path == "" {
+		return fmt.Errorf("path is required")
+	}
+	return nil
 }

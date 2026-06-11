@@ -1,4 +1,4 @@
-package permissions
+package permission
 
 // PermissionMode is the default behaviour when no rule matches.
 type PermissionMode string
@@ -35,9 +35,9 @@ type RuleValue struct {
 
 // PermissionRule is one entry in the configuration.
 type PermissionRule struct {
-	Source      RuleSource  `json:"source"`
+	Source       RuleSource   `json:"source"`
 	RuleBehavior RuleBehavior `json:"ruleBehavior"`
-	RuleValue   RuleValue   `json:"ruleValue"`
+	RuleValue    RuleValue    `json:"ruleValue"`
 }
 
 // Settings is the top-level configuration.

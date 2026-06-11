@@ -1,4 +1,4 @@
-package apiclient
+package api
 
 import (
 	"bufio"
@@ -9,28 +9,18 @@ import (
 	"io"
 	"net/http"
 	"strings"
-
-	"github.com/YYYSSSRRR/codepilot/internal/types"
 )
 
 const DefaultBaseURL = "https://api.deepseek.com/anthropic"
 
-// SSEEvent from the stream.
-type SSEEvent struct {
-	Type string
-	Data json.RawMessage
-}
-
-// Stream reads SSE events from the Anthropic Messages API.
-type Stream struct {
+type deepseekStream struct {
 	reader *bufio.Reader
 	body   io.ReadCloser
 	closed bool
-	event  string // current event type being assembled
+	event  string
 }
 
-// Recv reads the next SSE event. Returns io.EOF when the stream is done.
-func (s *Stream) Recv() (*SSEEvent, error) {
+func (s *deepseekStream) Recv() (*StreamEvent, error) {
 	for {
 		line, err := s.reader.ReadString('\n')
 		if err != nil {
@@ -44,13 +34,13 @@ func (s *Stream) Recv() (*SSEEvent, error) {
 
 		case strings.HasPrefix(line, "data: "):
 			data := strings.TrimPrefix(line, "data: ")
-			event := &SSEEvent{Type: s.event, Data: json.RawMessage(data)}
+			raw := json.RawMessage(data)
+			ev := &StreamEvent{Type: s.event, Data: raw}
 			s.event = ""
-			// Handle the "data: [DONE]" sentinel for some SSE APIs
-			if string(event.Data) == "[DONE]" {
+			if string(raw) == "[DONE]" {
 				continue
 			}
-			return event, nil
+			return ev, nil
 
 		case line == "":
 			continue
@@ -61,8 +51,7 @@ func (s *Stream) Recv() (*SSEEvent, error) {
 	}
 }
 
-// Close closes the underlying response body.
-func (s *Stream) Close() error {
+func (s *deepseekStream) Close() error {
 	if !s.closed {
 		s.closed = true
 		return s.body.Close()
@@ -70,26 +59,25 @@ func (s *Stream) Close() error {
 	return nil
 }
 
-// Client manages HTTP connections to the Anthropic-compatible API.
-type Client struct {
+// DeepSeek implements the Client interface for DeepSeek's Anthropic-compatible API.
+type DeepSeek struct {
 	apiKey  string
 	baseURL string
 	http    *http.Client
 }
 
-func NewClient(apiKey, baseURL string) *Client {
+func NewDeepSeek(apiKey, baseURL string) *DeepSeek {
 	if baseURL == "" {
 		baseURL = DefaultBaseURL
 	}
-	return &Client{
+	return &DeepSeek{
 		apiKey:  apiKey,
 		baseURL: baseURL,
 		http:    http.DefaultClient,
 	}
 }
 
-// StreamMessages establishes a streaming connection.
-func (c *Client) StreamMessages(ctx context.Context, req types.APIRequest) (*Stream, error) {
+func (c *DeepSeek) StreamMessages(ctx context.Context, req *Request) (Streamer, error) {
 	req.Stream = true
 
 	body, err := json.Marshal(req)
@@ -103,8 +91,6 @@ func (c *Client) StreamMessages(ctx context.Context, req types.APIRequest) (*Str
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
-	// Both auth headers for compatibility (Anthropic SDK uses x-api-key,
-	// DeepSeek uses Authorization: Bearer).
 	httpReq.Header.Set("x-api-key", c.apiKey)
 	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
 	httpReq.Header.Set("anthropic-version", "2023-06-01")
@@ -121,7 +107,7 @@ func (c *Client) StreamMessages(ctx context.Context, req types.APIRequest) (*Str
 		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	return &Stream{
+	return &deepseekStream{
 		reader: bufio.NewReader(resp.Body),
 		body:   resp.Body,
 	}, nil

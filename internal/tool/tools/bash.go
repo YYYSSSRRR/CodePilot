@@ -48,11 +48,12 @@ func (t *BashTool) Call(ctx context.Context, input map[string]any) (string, erro
 	return string(output), nil
 }
 
-// CheckPermissions implements tool.PermissionedTool.
-func (t *BashTool) CheckPermissions(input map[string]any) (bool, string, string, error) {
-	cmdStr, _ := input["command"].(string)
+func (t *BashTool) MaxResultSize() int { return 0 }
 
-	// Read-only commands that are always safe
+func (t *BashTool) IsConcurrencySafe(input map[string]any) bool { return false }
+
+func (t *BashTool) IsReadOnly(input map[string]any) bool {
+	cmdStr, _ := input["command"].(string)
 	readOnlyPrefixes := []string{
 		"ls", "cat", "head", "tail", "echo", "pwd", "which",
 		"git status", "git diff", "git log", "git branch",
@@ -60,11 +61,19 @@ func (t *BashTool) CheckPermissions(input map[string]any) (bool, string, string,
 	}
 	for _, prefix := range readOnlyPrefixes {
 		if strings.HasPrefix(strings.TrimSpace(cmdStr), prefix) {
-			return true, "allow", "", nil
+			return true
 		}
 	}
+	return false
+}
 
-	// Danger commands that should always be denied (unless explicitly allowed by rules)
+func (t *BashTool) CheckPermissions(input map[string]any) (bool, string, string, error) {
+	cmdStr, _ := input["command"].(string)
+	if cmdStr == "" {
+		return false, "deny", "command is required", nil
+	}
+
+	// Danger commands that should always be denied
 	dangerPrefixes := []string{
 		"rm -rf /", "dd ", ":(){ :|:& };:",
 	}
@@ -74,17 +83,19 @@ func (t *BashTool) CheckPermissions(input map[string]any) (bool, string, string,
 		}
 	}
 
-	// Write operations — return "ask" so the permission pipeline can check rules
+	// Read-only commands — allow directly
+	if t.IsReadOnly(input) {
+		return false, "allow", "", nil
+	}
+
+	// Write operations — ask via pipeline
 	return false, "ask", "this command may modify the system", nil
 }
 
-func (t *BashTool) IsWriteOperation(input map[string]any) bool {
+func (t *BashTool) ValidateInput(input map[string]any) error {
 	cmdStr, _ := input["command"].(string)
-	readOnlyPrefixes := []string{"ls", "cat", "head", "tail", "echo", "pwd", "which", "git status", "git diff", "git log", "npm list"}
-	for _, prefix := range readOnlyPrefixes {
-		if strings.HasPrefix(strings.TrimSpace(cmdStr), prefix) {
-			return false
-		}
+	if cmdStr == "" {
+		return fmt.Errorf("command is required")
 	}
-	return true
+	return nil
 }

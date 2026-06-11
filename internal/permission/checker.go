@@ -1,4 +1,4 @@
-package permissions
+package permission
 
 import (
 	"context"
@@ -22,12 +22,12 @@ func NewChecker(settings *Settings, registry *tool.Registry) *Checker {
 func (c *Checker) Check(ctx context.Context, toolName string, input map[string]any, toolUseID string) Result {
 	content := c.invocationContent(toolName, input)
 
-	// Step 1a: Blanket deny — tool name + content="*" (deny all invocations)
+	// Step 1a: Blanket deny
 	if c.hasRule(toolName, "*", BehaviorDeny) {
 		return Result{Decision: DecisionDeny, Message: "denied by blanket rule"}
 	}
 
-	// Step 1b: Blanket allow — tool name + content="*" (allow all invocations)
+	// Step 1b: Blanket allow
 	if c.hasRule(toolName, "*", BehaviorAllow) {
 		return Result{Decision: DecisionAllow}
 	}
@@ -42,9 +42,9 @@ func (c *Checker) Check(ctx context.Context, toolName string, input map[string]a
 		return Result{Decision: DecisionAllow}
 	}
 
-	// Step 2: Tool's own checkPermissions
-	if pt, err := c.registry.FindPermissioned(toolName); err == nil && pt != nil {
-		allowed, behavior, msg, checkErr := pt.CheckPermissions(input)
+	// Step 2: Tool's own CheckPermissions
+	if t := c.registry.FindByName(toolName); t != nil {
+		allowed, behavior, msg, checkErr := t.CheckPermissions(input)
 		if checkErr == nil && !allowed {
 			return Result{
 				Decision: c.behaviorToDecision(behavior),
@@ -55,44 +55,40 @@ func (c *Checker) Check(ctx context.Context, toolName string, input map[string]a
 
 	// Step 3: Pre-tool hooks (reserved)
 
-	// Step 4: Ask rules — content pattern match
+	// Step 4: Ask rules
 	if c.hasRule(toolName, content, BehaviorAsk) {
 		return Result{Decision: DecisionAsk}
 	}
 
 	// Step 5: Default behaviour based on permissionMode
-	return c.defaultResult(toolName)
+	return c.defaultResult(toolName, input)
 }
 
-func (c *Checker) defaultResult(toolName string) Result {
+func (c *Checker) defaultResult(toolName string, input map[string]any) Result {
+	isReadOnly := c.isReadOnlyTool(toolName, input)
+
 	switch c.settings.PermissionMode {
 	case ModeBypass:
 		return Result{Decision: DecisionAllow}
 	case ModePlan:
-		if c.isWriteTool(toolName) {
+		if !isReadOnly {
 			return Result{Decision: DecisionDeny, Message: "write operations denied in plan mode"}
 		}
 		return Result{Decision: DecisionAllow}
-	default: // ModeDefault
-		if c.isWriteTool(toolName) {
+	default:
+		if !isReadOnly {
 			return Result{Decision: DecisionAsk}
 		}
 		return Result{Decision: DecisionAllow}
 	}
 }
 
-func (c *Checker) isWriteTool(name string) bool {
-	writeTools := map[string]bool{
-		"Bash":     true,
-		"Write":    true,
-		"Edit":     true,
-		"FileEdit": true,
-		"create":   true,
-		"edit":     true,
-		"write":    true,
-		"function": true,
+func (c *Checker) isReadOnlyTool(name string, input map[string]any) bool {
+	t := c.registry.FindByName(name)
+	if t == nil {
+		return false
 	}
-	return writeTools[name]
+	return t.IsReadOnly(input)
 }
 
 func (c *Checker) hasRule(toolName, content string, behavior RuleBehavior) bool {
@@ -123,10 +119,7 @@ func (c *Checker) globMatch(pattern, str string) bool {
 			dirPrefix := strings.TrimSuffix(pattern, "/**")
 			return str == dirPrefix || strings.HasPrefix(str, dirPrefix+"/")
 		}
-		if strings.HasPrefix(str, prefix) {
-			return true
-		}
-		return false
+		return strings.HasPrefix(str, prefix)
 	}
 	if strings.Contains(pattern, "*") {
 		return false
@@ -147,18 +140,17 @@ func (c *Checker) behaviorToDecision(b string) Decision {
 	}
 }
 
-// invocationContent extracts a string representation of the tool's input for pattern matching.
 func (c *Checker) invocationContent(toolName string, input map[string]any) string {
 	switch toolName {
-	case "Bash", "execute_bash", "bash":
+	case "Bash":
 		if cmd, ok := input["command"].(string); ok {
 			return cmd
 		}
-	case "Read", "read", "file_read":
+	case "Read":
 		if path, ok := input["path"].(string); ok {
 			return path
 		}
-	case "Write", "write", "file_write":
+	case "Write":
 		if path, ok := input["path"].(string); ok {
 			return filepath.ToSlash(path)
 		}

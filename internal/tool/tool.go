@@ -1,75 +1,36 @@
 package tool
 
-import (
-	"context"
-	"fmt"
+import "context"
 
-	"github.com/YYYSSSRRR/codepilot/internal/types"
-)
-
-// Tool is the interface every tool must implement.
+// Tool is the unified interface every tool must implement.
 type Tool interface {
+	// Identity
 	Name() string
 	Description() string
 	InputSchema() map[string]any
+
+	// Execution
 	Call(ctx context.Context, input map[string]any) (string, error)
-}
 
-// PermissionedTool is an optional interface for tools with custom permission logic.
-type PermissionedTool interface {
-	Tool
-	// CheckPermissions returns true/false and a machine-readable behavior hint.
-	// behavior may be "allow", "deny", or "ask".
+	// MaxResultSize returns the maximum number of characters in the result.
+	// 0 means unlimited. Results exceeding this are truncated and saved to temp files.
+	MaxResultSize() int
+
+	// IsConcurrencySafe returns true if this tool can be executed concurrently.
+	IsConcurrencySafe(input map[string]any) bool
+
+	// IsReadOnly returns true if this tool invocation does not modify state.
+	IsReadOnly(input map[string]any) bool
+
+	// CheckPermissions returns whether the invocation is allowed, a behavior hint,
+	// and a human-readable message.
+	//
+	// allowed=false + behavior="allow" → tool has decided to allow
+	// allowed=false + behavior="deny"  → tool has decided to deny
+	// allowed=false + behavior="ask"   → tool wants user confirmation
+	// allowed=true                     → tool defers to the pipeline
 	CheckPermissions(input map[string]any) (allowed bool, behavior string, message string, err error)
-	// IsWriteOperation returns true if this tool invocation would modify state.
-	IsWriteOperation(input map[string]any) bool
-}
 
-// Registry holds the set of registered tools.
-type Registry struct {
-	tools []Tool
-	index map[string]Tool
-}
-
-func NewRegistry(tools ...Tool) *Registry {
-	r := &Registry{
-		tools: tools,
-		index: make(map[string]Tool, len(tools)),
-	}
-	for _, t := range tools {
-		r.index[t.Name()] = t
-	}
-	return r
-}
-
-func (r *Registry) FindByName(name string) Tool {
-	return r.index[name]
-}
-
-func (r *Registry) GetAll() []Tool {
-	return r.tools
-}
-
-func (r *Registry) Definitions() []types.APIToolParam {
-	out := make([]types.APIToolParam, 0, len(r.tools))
-	for _, t := range r.tools {
-		out = append(out, types.APIToolParam{
-			Name:        t.Name(),
-			Description: t.Description(),
-			InputSchema: t.InputSchema(),
-		})
-	}
-	return out
-}
-
-func (r *Registry) FindPermissioned(name string) (PermissionedTool, error) {
-	t := r.index[name]
-	if t == nil {
-		return nil, fmt.Errorf("tool %q not found", name)
-	}
-	pt, ok := t.(PermissionedTool)
-	if !ok {
-		return nil, nil
-	}
-	return pt, nil
+	// ValidateInput checks that the input map has all required fields with correct types.
+	ValidateInput(input map[string]any) error
 }
