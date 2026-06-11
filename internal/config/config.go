@@ -14,6 +14,7 @@ type Config struct {
 	APIKey       string
 	BaseURL      string
 	Model        string
+	SmallModel   string // cheaper model for memory classification (falls back to Model)
 	MaxTokens    int
 	WorkingDir   string
 	Settings     *permission.Settings
@@ -25,6 +26,7 @@ type settingsFile struct {
 	APIKey          string                    `json:"apiKey"`
 	BaseURL         string                    `json:"baseUrl"`
 	Model           string                    `json:"model"`
+	SmallModel      string                    `json:"smallModel,omitempty"`
 	MaxTokens       int                       `json:"maxTokens,omitempty"`
 	PermissionMode  permission.PermissionMode `json:"permissionMode,omitempty"`
 	PermissionRules []permission.PermissionRule `json:"permissionRules,omitempty"`
@@ -94,6 +96,7 @@ func Load() (*Config, error) {
 		APIKey:       sf.APIKey,
 		BaseURL:      sf.BaseURL,
 		Model:        sf.Model,
+		SmallModel:   sf.SmallModel,
 		MaxTokens:    maxTokens,
 		WorkingDir:   wd,
 		SettingsPath: settingsPath,

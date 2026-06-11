@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/YYYSSSRRR/codepilot/internal/api"
+	memoryutils "github.com/YYYSSSRRR/codepilot/internal/utils/memory"
 	"github.com/YYYSSSRRR/codepilot/pkg/types"
 )
 
@@ -26,42 +27,43 @@ type QueryDeps struct {
 	CanUseTool  func(ctx context.Context, toolName string, input map[string]any, toolUseID string) (bool, string)
 	ExecuteTool func(ctx context.Context, toolName string, input map[string]any) (string, bool, error)
 	Compact     func(messages []types.Message) []types.Message
-	// RecordTranscript persists the current message list after each turn.
-	// Called fire-and-forget from the streaming goroutine.
 	RecordTranscript func(messages []types.Message)
 
-	// TokenCount returns the total token count for the message list.
-	// Uses exact API usage + local estimation for tail messages.
-	TokenCount func(messages []types.Message) int
-
-	// AutoCompactThreshold returns the token count at which compaction triggers.
+	TokenCount           func(messages []types.Message) int
 	AutoCompactThreshold func() int
+	EffectiveWindow      func() int
 
-	// EffectiveWindow returns the usable context window (total minus output reservation).
-	EffectiveWindow func() int
+	// MemoryPrefetch config for async memory retrieval. If nil, prefetch is skipped.
+	MemoryPrefetch *memoryutils.PrefetchConfig
 }
 
 // Runner drives the ReAct loop. Create via NewRunner.
 type Runner struct {
 	deps      QueryDeps
-	system    string
 	model     string
 	maxTokens int
 }
 
-func NewRunner(deps QueryDeps, system, model string, maxTokens int) *Runner {
+func NewRunner(deps QueryDeps, model string, maxTokens int) *Runner {
 	return &Runner{
 		deps:      deps,
-		system:    system,
 		model:     model,
 		maxTokens: maxTokens,
 	}
 }
 
 // Run starts the ReAct loop. It blocks until the conversation turn is done.
-// Returns the final message list (including assistant responses and tool results).
-func (r *Runner) Run(ctx context.Context, messages []types.Message, tools []types.ToolParam, events chan<- Event) []types.Message {
+func (r *Runner) Run(ctx context.Context, system string, messages []types.Message, tools []types.ToolParam, events chan<- Event) []types.Message {
 	defer close(events)
+
+	// ── Async memory prefetch ──────────────────────────────────────────
+	var memoryCh <-chan []types.Message
+	var memoryConsumed bool
+	if r.deps.MemoryPrefetch != nil {
+		if q := lastUserQuery(messages); q != "" {
+			memoryCh = memoryutils.Prefetch(ctx, *r.deps.MemoryPrefetch, q)
+		}
+	}
 
 	turnMsgs := messages
 
@@ -81,7 +83,6 @@ func (r *Runner) Run(ctx context.Context, messages []types.Message, tools []type
 				hardLimit = r.deps.EffectiveWindow() - 3000
 			}
 
-			// Hard limit: prompt too long
 			if hardLimit > 0 && total >= hardLimit {
 				events <- Event{
 					Type: EventError,
@@ -91,18 +92,16 @@ func (r *Runner) Run(ctx context.Context, messages []types.Message, tools []type
 				return turnMsgs
 			}
 
-			// Auto-compact threshold
 			if total >= threshold && r.deps.Compact != nil {
 				turnMsgs = r.deps.Compact(turnMsgs)
 			}
 		} else if r.deps.Compact != nil {
-			// Fallback: compact unconditionally if no token info available
 			turnMsgs = r.deps.Compact(turnMsgs)
 		}
 
-		// Process a single model turn — streams response and collects tool_uses
+		// ── API call ───────────────────────────────────────────────────
 		executor := NewStreamingToolExecutor(r.deps)
-		turnResult := r.processTurn(ctx, turnMsgs, tools, executor, events)
+		turnResult := r.processTurn(ctx, system, turnMsgs, tools, executor, events)
 
 		if turnResult.Err != nil {
 			if errors.Is(turnResult.Err, context.Canceled) {
@@ -121,10 +120,22 @@ func (r *Runner) Run(ctx context.Context, messages []types.Message, tools []type
 			Usage:      turnResult.AssistantMsg.Usage,
 		}
 
-		// No tool uses — model response is final
+		// ── Inject prefetched memory ─────────────────────────────────
+		if !memoryConsumed && memoryCh != nil {
+			select {
+			case memMsgs, ok := <-memoryCh:
+				if ok && len(memMsgs) > 0 {
+					turnMsgs = append(turnMsgs, memMsgs...)
+				}
+				memoryConsumed = true
+			default:
+				// Not ready yet — will try again next turn
+			}
+		}
+
+		// ── No tool uses → done ───────────────────────────────────────
 		if len(turnResult.ToolUses) == 0 {
 			if r.deps.RecordTranscript != nil {
-				// Include the final assistant message for transcript completeness
 				complete := turnMsgs
 				if turnResult.AssistantMsg.Role != "" {
 					complete = append(complete, turnResult.AssistantMsg)
@@ -135,12 +146,11 @@ func (r *Runner) Run(ctx context.Context, messages []types.Message, tools []type
 			return turnMsgs
 		}
 
-		// Append assistant message to history
 		if turnResult.AssistantMsg.Role != "" {
 			turnMsgs = append(turnMsgs, turnResult.AssistantMsg)
 		}
 
-		// Execute all tools synchronously (one at a time) and emit results
+		// ── Execute tools ──────────────────────────────────────────────
 		allUpdates := executor.ExecuteAll(ctx)
 		for _, update := range allUpdates {
 			events <- Event{
@@ -151,21 +161,36 @@ func (r *Runner) Run(ctx context.Context, messages []types.Message, tools []type
 			}
 		}
 
-		// Check for interruption during tool execution
 		if err := ctx.Err(); err != nil {
 			events <- Event{Type: EventTurnComplete, StopReason: "user_interrupt"}
 			events <- Event{Type: EventQueryDone}
 			return turnMsgs
 		}
 
-		// Append tool results as a user message and loop back
 		turnMsgs = append(turnMsgs, types.NewMessage("user", UpdatesToBlocks(allUpdates)))
 
-		// Persist after each complete turn (assistant response + tool results)
 		if r.deps.RecordTranscript != nil {
 			r.deps.RecordTranscript(turnMsgs)
 		}
 	}
+}
+
+// lastUserQuery extracts the text content of the most recent user message.
+func lastUserQuery(messages []types.Message) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "user" {
+			var b strings.Builder
+			for _, block := range messages[i].Content {
+				if block.Type == types.ContentBlockText {
+					b.WriteString(block.Text)
+				}
+			}
+			if b.Len() > 0 {
+				return b.String()
+			}
+		}
+	}
+	return ""
 }
 
 // ---------------------------------------------------------------------------
@@ -178,7 +203,7 @@ type turn struct {
 	res       *TurnResultExt
 	accBlocks []accBlock
 	toolUses  []ToolUseInfo
-	usage     types.Usage // accumulated across streaming events
+	usage     types.Usage
 }
 
 type accBlock struct {
@@ -194,7 +219,6 @@ func newTurn(ctx context.Context, events chan<- Event) *turn {
 	}
 }
 
-// TurnResult holds the assistant message and tool usage info from one API turn.
 type TurnResult struct {
 	AssistantMsg types.Message
 	ToolUses     []ToolUseInfo
@@ -202,16 +226,15 @@ type TurnResult struct {
 	Usage        types.Usage
 }
 
-// TurnResultExt extends TurnResult with errors.
 type TurnResultExt struct {
 	TurnResult
 	Err error
 }
 
-func (r *Runner) processTurn(ctx context.Context, msgs []types.Message, tools []types.ToolParam, executor *StreamingToolExecutor, events chan<- Event) *TurnResultExt {
+func (r *Runner) processTurn(ctx context.Context, system string, msgs []types.Message, tools []types.ToolParam, executor *StreamingToolExecutor, events chan<- Event) *TurnResultExt {
 	t := newTurn(ctx, events)
 
-	req := api.MarshalRequest(msgs, tools, r.system, r.model, r.maxTokens)
+	req := api.MarshalRequest(msgs, tools, system, r.model, r.maxTokens)
 	stream, err := r.deps.CallModel(ctx, req)
 	if err != nil {
 		t.res.Err = fmt.Errorf("API call: %w", err)
@@ -219,7 +242,6 @@ func (r *Runner) processTurn(ctx context.Context, msgs []types.Message, tools []
 	}
 	defer stream.Close()
 
-	// Stream close on cancel to unblock Recv
 	go func() {
 		<-ctx.Done()
 		stream.Close()
@@ -246,28 +268,19 @@ func (r *Runner) processTurn(ctx context.Context, msgs []types.Message, tools []
 		switch sseEvent.Type {
 		case "message_start":
 			t.handleMessageStart(sseEvent.Data)
-
 		case "content_block_start":
 			t.handleBlockStart(sseEvent.Data)
-
 		case "content_block_delta":
 			t.handleBlockDelta(sseEvent.Data)
-
 		case "content_block_stop":
 			t.handleBlockStop(sseEvent.Data, executor)
-
 		case "message_delta":
 			t.handleMessageDelta(sseEvent.Data)
-
 		case "message_stop":
-			// All content blocks received
-
 		case "error":
 			t.handleAPIError(sseEvent.Data)
 			return t.res
-
 		case "ping":
-			// heartbeat
 		}
 
 		if t.res.Err != nil {
@@ -275,7 +288,6 @@ func (r *Runner) processTurn(ctx context.Context, msgs []types.Message, tools []
 		}
 	}
 
-	// Build assistant message from accumulated blocks
 	blocks := make([]types.ContentBlock, 0, len(t.accBlocks))
 	for _, ab := range t.accBlocks {
 		blocks = append(blocks, ab.block)
@@ -372,11 +384,9 @@ func (t *turn) handleBlockDelta(data any) {
 		t.accBlocks[idx].block.Type = types.ContentBlockText
 		t.accBlocks[idx].block.Text += deltaData.Delta.Text
 		t.events <- Event{Type: EventTextChunk, Text: deltaData.Delta.Text}
-
 	case "thinking_delta":
 		t.accBlocks[idx].block.Type = types.ContentBlockThinking
 		t.accBlocks[idx].block.Thinking += deltaData.Delta.Text
-
 	case "input_json_delta":
 		t.accBlocks[idx].jsonSB.WriteString(deltaData.Delta.PartialJSON)
 		t.events <- Event{
@@ -406,8 +416,6 @@ func (t *turn) handleBlockStop(data any, executor *StreamingToolExecutor) {
 	}
 
 	ab := &t.accBlocks[idx]
-
-	// Finalize tool_use input from accumulated JSON deltas
 	if ab.block.Type == types.ContentBlockToolUse && ab.jsonSB.Len() > 0 {
 		var input map[string]any
 		if err := json.Unmarshal([]byte(ab.jsonSB.String()), &input); err == nil {
@@ -434,8 +442,6 @@ func (t *turn) handleBlockStop(data any, executor *StreamingToolExecutor) {
 	}
 
 	t.toolUses = append(t.toolUses, tu)
-
-	// Queue tool for concurrent execution
 	executor.AddTool(tu)
 }
 

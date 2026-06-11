@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -11,16 +12,20 @@ import (
 	"time"
 
 	"github.com/YYYSSSRRR/codepilot/internal/api"
+	"github.com/YYYSSSRRR/codepilot/internal/memory"
 	"github.com/YYYSSSRRR/codepilot/internal/permission"
 	"github.com/YYYSSSRRR/codepilot/internal/query"
 	"github.com/YYYSSSRRR/codepilot/internal/token"
 	"github.com/YYYSSSRRR/codepilot/internal/tool"
+	"github.com/YYYSSSRRR/codepilot/internal/transcript"
+	memoryutils "github.com/YYYSSSRRR/codepilot/internal/utils/memory"
 	"github.com/YYYSSSRRR/codepilot/pkg/types"
 )
 
 // Config for the QueryEngine.
 type Config struct {
 	Model        string
+	SmallModel   string
 	SystemPrompt string
 	MaxTokens    int
 	APIKey       string
@@ -28,14 +33,10 @@ type Config struct {
 	Tools        *tool.Registry
 	Permissions  *permission.Checker
 
-	// ContextWindow sets the model's total context window in tokens.
-	// If zero, defaults to 128000.
 	ContextWindow int
 
-	// Transcript persists conversation history. If nil, persistence is skipped.
 	Transcript TranscriptStore
 
-	// OnPermissionAsk is called when the permission pipeline reaches an "ask" decision.
 	OnPermissionAsk func(ctx context.Context, toolName string, input map[string]any, toolUseID string, reason string) permission.Decision
 }
 
@@ -54,6 +55,9 @@ type QueryEngine struct {
 	messages []types.Message
 	cancel   context.CancelFunc
 	running  bool
+
+	memStore *memory.Store
+	memOnce  sync.Once
 }
 
 func New(cfg Config) *QueryEngine {
@@ -68,7 +72,6 @@ func New(cfg Config) *QueryEngine {
 	}
 }
 
-// SubmitMessage sends a user prompt and returns a channel of streaming events.
 func (e *QueryEngine) SubmitMessage(ctx context.Context, prompt string) (<-chan query.Event, error) {
 	e.mu.Lock()
 	if e.running {
@@ -77,12 +80,10 @@ func (e *QueryEngine) SubmitMessage(ctx context.Context, prompt string) (<-chan 
 	}
 	e.running = true
 
-	// Append user message
 	e.messages = append(e.messages, types.NewMessage("user", []types.ContentBlock{
 		{Type: types.ContentBlockText, Text: prompt},
 	}))
 
-	// Persist user message before the API call (synchronous)
 	if e.config.Transcript != nil {
 		if _, err := e.config.Transcript.RecordTranscript(e.messages); err != nil {
 			fmt.Fprintf(os.Stderr, "transcript: %v\n", err)
@@ -105,10 +106,10 @@ func (e *QueryEngine) SubmitMessage(ctx context.Context, prompt string) (<-chan 
 			e.mu.Unlock()
 		}()
 
-		runner := query.NewRunner(e.makeDeps(), e.config.SystemPrompt, e.config.Model, e.config.MaxTokens)
-		runner.Run(turnCtx, snapshot, e.config.Tools.Definitions(), events)
+		runner := query.NewRunner(e.makeDeps(), e.config.Model, e.config.MaxTokens)
+		system := e.buildSystem(turnCtx)
+		runner.Run(turnCtx, system, snapshot, e.config.Tools.Definitions(), events)
 
-		// Capture the updated messages from the runner
 		e.mu.Lock()
 		e.messages = snapshot
 		e.mu.Unlock()
@@ -117,7 +118,6 @@ func (e *QueryEngine) SubmitMessage(ctx context.Context, prompt string) (<-chan 
 	return events, nil
 }
 
-// Interrupt cancels the current turn.
 func (e *QueryEngine) Interrupt() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -126,7 +126,6 @@ func (e *QueryEngine) Interrupt() {
 	}
 }
 
-// Reset clears history and cancels any active turn.
 func (e *QueryEngine) Reset() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -136,27 +135,81 @@ func (e *QueryEngine) Reset() {
 	}
 }
 
-// IsRunning reports whether a turn is active.
 func (e *QueryEngine) IsRunning() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.running
 }
 
-// SetMessages replaces the in-memory message list (e.g. loaded from transcript).
 func (e *QueryEngine) SetMessages(msgs []types.Message) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.messages = append(make([]types.Message, 0, len(msgs)), msgs...)
 }
 
-// Messages returns a copy of the current message list.
 func (e *QueryEngine) Messages() []types.Message {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	out := make([]types.Message, len(e.messages))
 	copy(out, e.messages)
 	return out
+}
+
+// ---------------------------------------------------------------------------
+// System prompt assembly
+// ---------------------------------------------------------------------------
+
+func (e *QueryEngine) buildSystem(_ context.Context) string {
+	var parts []string
+	if e.config.SystemPrompt != "" {
+		parts = append(parts, e.config.SystemPrompt)
+	}
+	if memCtx := e.loadMemoryContext(); memCtx != "" {
+		parts = append(parts, memCtx)
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+// ---------------------------------------------------------------------------
+// Memory (system prompt section only; prefetch lives in utils/memory)
+// ---------------------------------------------------------------------------
+
+const memoryDirName = "memory"
+
+func memoryDir() string {
+	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	gitRoot := strings.TrimSpace(string(output))
+	if gitRoot == "" {
+		return ""
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	hash := transcript.ProjectDirHash(gitRoot)
+	return filepath.Join(home, ".codepilot", "projects", hash, memoryDirName)
+}
+
+func (e *QueryEngine) initMemory() {
+	e.memOnce.Do(func() {
+		dir := memoryDir()
+		if dir == "" {
+			return
+		}
+		e.memStore = memory.NewStore(dir)
+	})
+}
+
+func (e *QueryEngine) loadMemoryContext() string {
+	e.initMemory()
+	if e.memStore == nil {
+		return ""
+	}
+	return memory.BuildSystemPromptSection(e.memStore)
 }
 
 // ---------------------------------------------------------------------------
@@ -168,7 +221,6 @@ func (e *QueryEngine) makeDeps() query.QueryDeps {
 		CallModel: e.callModel,
 		CanUseTool: func(ctx context.Context, toolName string, input map[string]any, toolUseID string) (bool, string) {
 			result := e.config.Permissions.Check(ctx, toolName, input, toolUseID)
-
 			switch result.Decision {
 			case permission.DecisionDeny:
 				return false, result.Message
@@ -217,9 +269,13 @@ func (e *QueryEngine) makeDeps() query.QueryDeps {
 		TokenCount:           e.counter.TokenCount,
 		AutoCompactThreshold: e.counter.AutoCompactThreshold,
 		EffectiveWindow:      e.counter.EffectiveWindow,
+		MemoryPrefetch: &memoryutils.PrefetchConfig{
+			APIKey:     e.config.APIKey,
+			BaseURL:    e.config.BaseURL,
+			SmallModel: e.config.SmallModel,
+		},
 	}
 }
-
 
 func truncateResult(toolName, result string, maxSize int) string {
 	if maxSize <= 0 || len(result) <= maxSize {
