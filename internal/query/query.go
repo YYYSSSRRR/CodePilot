@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/YYYSSSRRR/codepilot/internal/api"
+	"github.com/YYYSSSRRR/codepilot/internal/compact"
 	memoryutils "github.com/YYYSSSRRR/codepilot/internal/utils/memory"
 	"github.com/YYYSSSRRR/codepilot/pkg/types"
 )
@@ -26,7 +27,9 @@ type QueryDeps struct {
 	CallModel   func(ctx context.Context, req *api.Request) (api.Streamer, error)
 	CanUseTool  func(ctx context.Context, toolName string, input map[string]any, toolUseID string) (bool, string)
 	ExecuteTool func(ctx context.Context, toolName string, input map[string]any) (string, bool, error)
-	Compact     func(messages []types.Message) []types.Message
+	CompactSystem     *compact.ToolUseContext
+	Microcompact      func(messages []types.Message) *compact.CompactResult
+	AutoCompact       func(ctx context.Context, messages []types.Message) ([]types.Message, error)
 	RecordTranscript func(messages []types.Message)
 
 	TokenCount           func(messages []types.Message) int
@@ -92,11 +95,48 @@ func (r *Runner) Run(ctx context.Context, system string, messages []types.Messag
 				return turnMsgs
 			}
 
-			if total >= threshold && r.deps.Compact != nil {
-				turnMsgs = r.deps.Compact(turnMsgs)
+			if total >= threshold {
+				// Layer 1: Tool result budget on active window
+				if r.deps.CompactSystem != nil {
+					boundIdx := compact.FindLastCompactBoundaryIndex(turnMsgs)
+					if boundIdx < 0 {
+						modified, _ := compact.ApplyToolResultBudget(turnMsgs,
+							r.deps.CompactSystem.ContentReplacement,
+							r.deps.CompactSystem.UnlimitedTools,
+							compact.DefaultToolResultBudget)
+						turnMsgs = modified
+					} else {
+						activeWindow := turnMsgs[boundIdx+1:]
+						modified, _ := compact.ApplyToolResultBudget(activeWindow,
+							r.deps.CompactSystem.ContentReplacement,
+							r.deps.CompactSystem.UnlimitedTools,
+							compact.DefaultToolResultBudget)
+						result := make([]types.Message, 0, boundIdx+1+len(modified))
+						result = append(result, turnMsgs[:boundIdx+1]...)
+						result = append(result, modified...)
+						turnMsgs = result
+					}
+				}
+
+				// Layer 2: Microcompact (time-based)
+				if r.deps.Microcompact != nil {
+					mcResult := r.deps.Microcompact(turnMsgs)
+					if mcResult != nil {
+						turnMsgs = mcResult.Messages
+					}
+				}
+
+				// Layer 3: AutoCompact if still over threshold
+				if r.deps.AutoCompact != nil {
+					if r.deps.TokenCount(turnMsgs) >= threshold {
+						var acErr error
+						turnMsgs, acErr = r.deps.AutoCompact(ctx, turnMsgs)
+						if acErr != nil {
+							events <- Event{Type: EventError, Err: fmt.Errorf("auto-compact: %w", acErr)}
+						}
+					}
+				}
 			}
-		} else if r.deps.Compact != nil {
-			turnMsgs = r.deps.Compact(turnMsgs)
 		}
 
 		// ── API call ───────────────────────────────────────────────────

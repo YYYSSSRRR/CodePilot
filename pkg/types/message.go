@@ -1,5 +1,7 @@
 package types
 
+import "time"
+
 type ContentBlockType string
 
 const (
@@ -48,10 +50,18 @@ type Message struct {
 	Role    string         `json:"role"`
 	Content []ContentBlock `json:"content"`
 	Usage   *Usage         `json:"usage,omitempty"`
+
+	// CompactBoundary marks a compaction boundary. Messages before this
+	// point have been summarized by a previous auto-compact.
+	CompactBoundary bool `json:"-"`
+
+	// Time records when the message was created, used for time-based
+	// micro-compaction decisions.
+	Time time.Time `json:"-"`
 }
 
 type Messages []Message
 
 func NewMessage(role string, content []ContentBlock) Message {
-	return Message{Role: role, Content: content}
+	return Message{Role: role, Content: content, Time: time.Now()}
 }

@@ -25,6 +25,17 @@ func (r *Registry) FindByName(name string) Tool {
 	return r.index[name]
 }
 
+// Register adds a tool to the registry. If a tool with the same name already
+// exists (e.g., a built-in tool), the new tool is silently skipped — existing
+// tools take priority.
+func (r *Registry) Register(t Tool) {
+	if _, exists := r.index[t.Name()]; exists {
+		return
+	}
+	r.tools = append(r.tools, t)
+	r.index[t.Name()] = t
+}
+
 func (r *Registry) GetAll() []Tool {
 	return r.tools
 }

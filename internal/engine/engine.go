@@ -12,9 +12,12 @@ import (
 	"time"
 
 	"github.com/YYYSSSRRR/codepilot/internal/api"
+	"github.com/YYYSSSRRR/codepilot/internal/compact"
+	"github.com/YYYSSSRRR/codepilot/internal/mcp"
 	"github.com/YYYSSSRRR/codepilot/internal/memory"
 	"github.com/YYYSSSRRR/codepilot/internal/permission"
 	"github.com/YYYSSSRRR/codepilot/internal/query"
+	"github.com/YYYSSSRRR/codepilot/internal/skill"
 	"github.com/YYYSSSRRR/codepilot/internal/token"
 	"github.com/YYYSSSRRR/codepilot/internal/tool"
 	"github.com/YYYSSSRRR/codepilot/internal/transcript"
@@ -38,6 +41,12 @@ type Config struct {
 	Transcript TranscriptStore
 
 	OnPermissionAsk func(ctx context.Context, toolName string, input map[string]any, toolUseID string, reason string) permission.Decision
+
+	// MCP manager for external tool servers (optional).
+	MCPManager *mcp.Manager
+
+	// SkillLoader for loading and listing skills (optional).
+	SkillLoader *skill.Loader
 }
 
 // TranscriptStore is the interface for persisting conversation transcripts.
@@ -164,6 +173,11 @@ func (e *QueryEngine) buildSystem(_ context.Context) string {
 	if e.config.SystemPrompt != "" {
 		parts = append(parts, e.config.SystemPrompt)
 	}
+	if e.config.SkillLoader != nil {
+		if skillsSection := e.config.SkillLoader.BuildSystemPromptSection(); skillsSection != "" {
+			parts = append(parts, skillsSection)
+		}
+	}
 	if memCtx := e.loadMemoryContext(); memCtx != "" {
 		parts = append(parts, memCtx)
 	}
@@ -258,7 +272,29 @@ func (e *QueryEngine) makeDeps() query.QueryDeps {
 			result = truncateResult(toolName, result, t.MaxResultSize())
 			return result, false, nil
 		},
-		Compact: nil, //TODO
+		CompactSystem: &compact.ToolUseContext{
+			ContentReplacement: &compact.ContentReplacementState{
+				Replacements: make(map[string]string),
+			},
+			UnlimitedTools: make(map[string]bool),
+		},
+		Microcompact: func(msgs []types.Message) *compact.CompactResult {
+			return compact.MaybeTimeBasedMicrocompact(msgs, compact.DefaultMicrocompactConfig())
+		},
+		AutoCompact: func(ctx context.Context, msgs []types.Message) ([]types.Message, error) {
+			client := api.NewDeepSeek(e.config.APIKey, e.config.BaseURL)
+			callLLM := func(innerCtx context.Context, prompt string) (string, error) {
+				req := &api.Request{
+					Model:     e.config.SmallModel,
+					MaxTokens: 1024,
+					Messages: []api.APIMessage{
+						{Role: "user", Content: prompt},
+					},
+				}
+				return client.CallMessages(innerCtx, req)
+			}
+			return compact.AutoCompact(ctx, msgs, callLLM)
+		},
 		RecordTranscript: func(messages []types.Message) {
 			if e.config.Transcript != nil {
 				if _, err := e.config.Transcript.RecordTranscript(messages); err != nil {

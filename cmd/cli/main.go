@@ -7,7 +7,9 @@ import (
 
 	"github.com/YYYSSSRRR/codepilot/internal/config"
 	"github.com/YYYSSSRRR/codepilot/internal/engine"
+	"github.com/YYYSSSRRR/codepilot/internal/mcp"
 	"github.com/YYYSSSRRR/codepilot/internal/permission"
+	"github.com/YYYSSSRRR/codepilot/internal/skill"
 	"github.com/YYYSSSRRR/codepilot/internal/tool"
 	"github.com/YYYSSSRRR/codepilot/internal/tool/tools"
 	"github.com/YYYSSSRRR/codepilot/internal/transcript"
@@ -30,6 +32,30 @@ func main() {
 		&tools.GrepTool{},
 		&tools.GlobTool{},
 	)
+
+	// ── MCP: connect to external tool servers ──────────────────────────
+	mcpManager, err := mcp.NewManager(context.Background())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mcp: %v\n", err)
+	}
+	if mcpManager != nil {
+		for _, t := range mcpManager.Tools() {
+			reg.Register(t)
+		}
+		defer mcpManager.Close()
+	}
+
+	// ── Skills: load available skills ──────────────────────────────────
+	skillLoader, err := skill.NewLoader()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "skill: %v\n", err)
+	}
+	if skillLoader != nil {
+		reg.Register(skill.NewTool(skillLoader))
+		if skills := skillLoader.All(); len(skills) > 0 {
+			fmt.Printf("Skills: %d loaded\n", len(skills))
+		}
+	}
 
 	checker := permission.NewChecker(cfg.Settings, reg)
 	prompter := ui.NewPermissionPrompter(cfg.SettingsPath)
@@ -67,6 +93,8 @@ func main() {
 		Tools:        reg,
 		Permissions:  checker,
 		Transcript:   store,
+		MCPManager:   mcpManager,
+		SkillLoader:  skillLoader,
 		OnPermissionAsk: prompter.Prompt,
 	})
 	if len(initialMessages) > 0 {
