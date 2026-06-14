@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/YYYSSSRRR/codepilot/internal/agent"
 	"github.com/YYYSSSRRR/codepilot/internal/config"
 	"github.com/YYYSSSRRR/codepilot/internal/engine"
 	"github.com/YYYSSSRRR/codepilot/internal/mcp"
@@ -57,6 +58,15 @@ func main() {
 		}
 	}
 
+	// ── Agents: load sub-agent definitions ──────────────────────────
+	agentMgr := initAgentManager(cfg, reg)
+	if agentMgr != nil {
+		reg.Register(agent.NewTool(agentMgr))
+		if agents := agentMgr.All(); len(agents) > 0 {
+			fmt.Printf("Agents: %d loaded", len(agents))
+		}
+	}
+
 	checker := permission.NewChecker(cfg.Settings, reg)
 	prompter := ui.NewPermissionPrompter(cfg.SettingsPath)
 
@@ -95,6 +105,7 @@ func main() {
 		Transcript:   store,
 		MCPManager:   mcpManager,
 		SkillLoader:  skillLoader,
+		AgentManager: agentMgr,
 		OnPermissionAsk: prompter.Prompt,
 	})
 	if len(initialMessages) > 0 {
@@ -121,8 +132,26 @@ Be concise and helpful. Your responses should be clear and actionable.
 Working directory: ` + wd
 }
 
-func init() {
-	// Ensure the agent, compact, context, search, and session packages
-	// are imported (stubs for future implementation).
-	var _ []struct{}
+func initAgentManager(cfg *config.Config, reg *tool.Registry) *agent.Manager {
+	agentLoader, err := agent.NewLoader()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "agent: %v", err)
+		return nil
+	}
+	if agentLoader == nil {
+		return nil
+	}
+
+	return agent.NewManager(agentLoader, agent.RunnerDeps{
+		APIKey:     cfg.APIKey,
+		BaseURL:    cfg.BaseURL,
+		Model:      cfg.Model,
+		MaxTokens:  cfg.MaxTokens,
+		ContextWin: 128000,
+		Registry:   reg,
+		CanUseTool: func(ctx context.Context, toolName string, input map[string]any, toolUseID string) (bool, string) {
+			return true, ""
+		},
+		RecordTranscript: nil,
+	})
 }

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/YYYSSSRRR/codepilot/internal/agent"
 	"github.com/YYYSSSRRR/codepilot/internal/api"
 	"github.com/YYYSSSRRR/codepilot/internal/compact"
 	"github.com/YYYSSSRRR/codepilot/internal/mcp"
@@ -47,6 +48,9 @@ type Config struct {
 
 	// SkillLoader for loading and listing skills (optional).
 	SkillLoader *skill.Loader
+
+	// AgentManager for sub-agent lifecycle (optional).
+	AgentManager *agent.Manager
 }
 
 // TranscriptStore is the interface for persisting conversation transcripts.
@@ -176,6 +180,11 @@ func (e *QueryEngine) buildSystem(_ context.Context) string {
 	if e.config.SkillLoader != nil {
 		if skillsSection := e.config.SkillLoader.BuildSystemPromptSection(); skillsSection != "" {
 			parts = append(parts, skillsSection)
+		}
+	}
+	if e.config.AgentManager != nil {
+		if agents := e.config.AgentManager.All(); len(agents) > 0 {
+			parts = append(parts, agent.BuildSystemPromptSection(agents))
 		}
 	}
 	if memCtx := e.loadMemoryContext(); memCtx != "" {
@@ -309,6 +318,22 @@ func (e *QueryEngine) makeDeps() query.QueryDeps {
 			APIKey:     e.config.APIKey,
 			BaseURL:    e.config.BaseURL,
 			SmallModel: e.config.SmallModel,
+		},
+		AsyncAgentCheck: func() []types.Message {
+			if e.config.AgentManager == nil {
+				return nil
+			}
+			results := e.config.AgentManager.DrainAsync()
+			if len(results) == 0 {
+				return nil
+			}
+			msgs := make([]types.Message, 0, len(results))
+			for _, r := range results {
+				msgs = append(msgs, types.NewMessage("user", []types.ContentBlock{
+					{Type: types.ContentBlockText, Text: "## Async Sub-Agent Result\n\n**Agent Session ID**: " + r.SessionID + "\n\n" + r.Content},
+				}))
+			}
+			return msgs
 		},
 	}
 }

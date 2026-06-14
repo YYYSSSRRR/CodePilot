@@ -38,6 +38,10 @@ type QueryDeps struct {
 
 	// MemoryPrefetch config for async memory retrieval. If nil, prefetch is skipped.
 	MemoryPrefetch *memoryutils.PrefetchConfig
+
+	// AsyncAgentCheck returns pending async sub-agent results as user messages.
+	// Called between turns to inject completed background agent results.
+	AsyncAgentCheck func() []types.Message
 }
 
 // Runner drives the ReAct loop. Create via NewRunner.
@@ -170,6 +174,13 @@ func (r *Runner) Run(ctx context.Context, system string, messages []types.Messag
 				memoryConsumed = true
 			default:
 				// Not ready yet — will try again next turn
+			}
+		}
+
+		// ── Inject async sub-agent results ─────────────────────────
+		if r.deps.AsyncAgentCheck != nil {
+			if results := r.deps.AsyncAgentCheck(); len(results) > 0 {
+				turnMsgs = append(turnMsgs, results...)
 			}
 		}
 
